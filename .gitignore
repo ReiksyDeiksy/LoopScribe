@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+build/
+dist/
+src/*.egg-info/
+src/**/*.egg-info/
+src/recorder_app/native/CSC*.TMP
+smoke_output/app_audio_capture_smoke.wav
+tmp/app_audio_service_smoke/
