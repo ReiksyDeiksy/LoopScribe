@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import ctypes
+from ctypes import wintypes
 from dataclasses import dataclass
 from datetime import datetime
 import json
@@ -9,6 +11,7 @@ import subprocess
 import sys
 import threading
 import time
+from uuid import UUID
 
 import numpy as np
 import soundcard as sc
@@ -35,6 +38,8 @@ COMBINED_MERGE_PROGRESS_LOG_INTERVAL_SECONDS = 10.0
 APP_AUDIO_HELPER_NAME = "app_audio_capture.exe"
 APP_AUDIO_HELPER_TIMEOUT_SECONDS = 8.0
 APP_AUDIO_HELPER_STOP_TIMEOUT_SECONDS = 10.0
+AUDIO_STATE_POLL_INTERVAL_SECONDS = 2.0
+AUDIO_STATE_VOLUME_CHANGE_TOLERANCE = 0.005
 
 
 class AudioCaptureError(RuntimeError):
@@ -48,6 +53,419 @@ class RecordingResult:
     started_at: datetime
     finished_at: datetime
     capture_device: str
+
+
+@dataclass(slots=True)
+class AudioEndpointStateSnapshot:
+    flow: str
+    role: str
+    endpoint_id: str = ""
+    display_name: str = ""
+    master_volume_scalar: float | None = None
+    muted: bool | None = None
+    error: str = ""
+
+    @property
+    def is_available(self) -> bool:
+        return not self.error and bool(self.endpoint_id)
+
+    def has_level_or_mute_change(
+        self,
+        baseline: "AudioEndpointStateSnapshot",
+        *,
+        tolerance: float = AUDIO_STATE_VOLUME_CHANGE_TOLERANCE,
+    ) -> bool:
+        if self.muted is not None and baseline.muted is not None and self.muted != baseline.muted:
+            return True
+        if self.master_volume_scalar is None or baseline.master_volume_scalar is None:
+            return False
+        return abs(self.master_volume_scalar - baseline.master_volume_scalar) > tolerance
+
+    def change_signature(self, baseline: "AudioEndpointStateSnapshot") -> tuple[object, ...]:
+        return (
+            baseline.endpoint_id,
+            self.endpoint_id,
+            _rounded_scalar(baseline.master_volume_scalar),
+            _rounded_scalar(self.master_volume_scalar),
+            baseline.muted,
+            self.muted,
+        )
+
+    def describe(self) -> str:
+        label = self.display_name or self.endpoint_id or "<nicht verfuegbar>"
+        volume = (
+            f"{self.master_volume_scalar * 100:.1f}%"
+            if self.master_volume_scalar is not None
+            else "unbekannt"
+        )
+        muted = "unbekannt" if self.muted is None else ("ja" if self.muted else "nein")
+        details = (
+            f"{self.flow}/{self.role}: {label}; id={self.endpoint_id or '<leer>'}; "
+            f"volume={volume}; muted={muted}"
+        )
+        if self.error:
+            details = f"{details}; error={self.error}"
+        return details
+
+
+@dataclass(slots=True)
+class AudioSystemStateSnapshot:
+    captured_at: datetime
+    default_render: AudioEndpointStateSnapshot
+    default_capture: AudioEndpointStateSnapshot
+
+
+def _rounded_scalar(value: float | None) -> float | None:
+    if value is None:
+        return None
+    return round(value, 4)
+
+
+class WindowsAudioEndpointStateReader:
+    """Read-only Windows CoreAudio endpoint diagnostics."""
+
+    _CLSID_MMDEVICE_ENUMERATOR = None
+    _IID_IMMDEVICE_ENUMERATOR = None
+    _IID_AUDIO_ENDPOINT_VOLUME = None
+
+    def read_default_state(self) -> AudioSystemStateSnapshot:
+        captured_at = datetime.now()
+        if sys.platform != "win32":
+            return self._unavailable_state(captured_at, "CoreAudio ist nur unter Windows verfuegbar.")
+
+        try:
+            with _CoreAudioComSession():
+                enumerator = self._create_device_enumerator()
+                try:
+                    return AudioSystemStateSnapshot(
+                        captured_at=captured_at,
+                        default_render=self._read_default_endpoint(
+                            enumerator,
+                            flow=0,
+                            role=0,
+                            flow_label="render",
+                            role_label="console",
+                        ),
+                        default_capture=self._read_default_endpoint(
+                            enumerator,
+                            flow=1,
+                            role=0,
+                            flow_label="capture",
+                            role_label="console",
+                        ),
+                    )
+                finally:
+                    _release_com_object(enumerator)
+        except Exception as exc:
+            logger.warning("Audio-Endpunkt-Diagnose konnte nicht gelesen werden: %s", exc)
+            return self._unavailable_state(captured_at, str(exc))
+
+    @classmethod
+    def _guid(cls, value: str) -> "_GUID":
+        return _GUID.from_string(value)
+
+    @classmethod
+    def _clsid_mmdevice_enumerator(cls) -> "_GUID":
+        if cls._CLSID_MMDEVICE_ENUMERATOR is None:
+            cls._CLSID_MMDEVICE_ENUMERATOR = cls._guid("BCDE0395-E52F-467C-8E3D-C4579291692E")
+        return cls._CLSID_MMDEVICE_ENUMERATOR
+
+    @classmethod
+    def _iid_immdevice_enumerator(cls) -> "_GUID":
+        if cls._IID_IMMDEVICE_ENUMERATOR is None:
+            cls._IID_IMMDEVICE_ENUMERATOR = cls._guid("A95664D2-9614-4F35-A746-DE8DB63617E6")
+        return cls._IID_IMMDEVICE_ENUMERATOR
+
+    @classmethod
+    def _iid_audio_endpoint_volume(cls) -> "_GUID":
+        if cls._IID_AUDIO_ENDPOINT_VOLUME is None:
+            cls._IID_AUDIO_ENDPOINT_VOLUME = cls._guid("5CDF2C82-841E-4546-9722-0CF74078229A")
+        return cls._IID_AUDIO_ENDPOINT_VOLUME
+
+    def _create_device_enumerator(self) -> ctypes.c_void_p:
+        ole32 = _ole32()
+        clsid = self._clsid_mmdevice_enumerator()
+        iid = self._iid_immdevice_enumerator()
+        enumerator = ctypes.c_void_p()
+        hr = ole32.CoCreateInstance(
+            ctypes.byref(clsid),
+            None,
+            _CLSCTX_ALL,
+            ctypes.byref(iid),
+            ctypes.byref(enumerator),
+        )
+        _check_hresult(hr, "CoCreateInstance(IMMDeviceEnumerator)")
+        return enumerator
+
+    def _read_default_endpoint(
+        self,
+        enumerator: ctypes.c_void_p,
+        *,
+        flow: int,
+        role: int,
+        flow_label: str,
+        role_label: str,
+    ) -> AudioEndpointStateSnapshot:
+        device = ctypes.c_void_p()
+        try:
+            get_default_endpoint = _com_method(
+                enumerator,
+                4,
+                _HRESULT,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.POINTER(ctypes.c_void_p),
+            )
+            hr = get_default_endpoint(enumerator, flow, role, ctypes.byref(device))
+            _check_hresult(hr, "IMMDeviceEnumerator.GetDefaultAudioEndpoint")
+            endpoint_id = _read_device_id(device)
+            master_volume_scalar, muted = self._read_endpoint_volume(device)
+            return AudioEndpointStateSnapshot(
+                flow=flow_label,
+                role=role_label,
+                endpoint_id=endpoint_id,
+                master_volume_scalar=master_volume_scalar,
+                muted=muted,
+            )
+        except Exception as exc:
+            return AudioEndpointStateSnapshot(
+                flow=flow_label,
+                role=role_label,
+                error=str(exc),
+            )
+        finally:
+            _release_com_object(device)
+
+    def _read_endpoint_volume(self, device: ctypes.c_void_p) -> tuple[float | None, bool | None]:
+        endpoint_volume = ctypes.c_void_p()
+        try:
+            iid = self._iid_audio_endpoint_volume()
+            activate = _com_method(
+                device,
+                3,
+                _HRESULT,
+                ctypes.POINTER(_GUID),
+                wintypes.DWORD,
+                ctypes.c_void_p,
+                ctypes.POINTER(ctypes.c_void_p),
+            )
+            hr = activate(
+                device,
+                ctypes.byref(iid),
+                _CLSCTX_ALL,
+                None,
+                ctypes.byref(endpoint_volume),
+            )
+            _check_hresult(hr, "IMMDevice.Activate(IAudioEndpointVolume)")
+
+            scalar = ctypes.c_float()
+            get_master_volume = _com_method(
+                endpoint_volume,
+                9,
+                _HRESULT,
+                ctypes.POINTER(ctypes.c_float),
+            )
+            hr = get_master_volume(endpoint_volume, ctypes.byref(scalar))
+            _check_hresult(hr, "IAudioEndpointVolume.GetMasterVolumeLevelScalar")
+
+            muted = wintypes.BOOL()
+            get_mute = _com_method(
+                endpoint_volume,
+                15,
+                _HRESULT,
+                ctypes.POINTER(wintypes.BOOL),
+            )
+            hr = get_mute(endpoint_volume, ctypes.byref(muted))
+            _check_hresult(hr, "IAudioEndpointVolume.GetMute")
+            return float(scalar.value), bool(muted.value)
+        finally:
+            _release_com_object(endpoint_volume)
+
+    @staticmethod
+    def _unavailable_state(captured_at: datetime, error: str) -> AudioSystemStateSnapshot:
+        return AudioSystemStateSnapshot(
+            captured_at=captured_at,
+            default_render=AudioEndpointStateSnapshot(
+                flow="render",
+                role="console",
+                error=error,
+            ),
+            default_capture=AudioEndpointStateSnapshot(
+                flow="capture",
+                role="console",
+                error=error,
+            ),
+        )
+
+
+class AppAudioStateMonitor:
+    def __init__(self, reader: WindowsAudioEndpointStateReader) -> None:
+        self._reader = reader
+        self._initial: AudioSystemStateSnapshot | None = None
+        self._last_change_signature: tuple[object, ...] | None = None
+
+    def start(self, session_label: str, *, includes_microphone: bool = False) -> None:
+        self._initial = self._safe_read_state()
+        logger.info(
+            "App-Audio-Diagnose Start: session=%s playback=%s mikrofon=%s "
+            "app_audio_oeffnet_mikrofon=%s",
+            session_label,
+            self._initial.default_render.describe(),
+            self._initial.default_capture.describe(),
+            "ja" if includes_microphone else "nein",
+        )
+
+    def poll(self) -> None:
+        if self._initial is None:
+            return
+        current = self._safe_read_state()
+        self._log_capture_change("waehrend der Aufnahme", current)
+
+    def finish(self) -> None:
+        if self._initial is None:
+            return
+        current = self._safe_read_state()
+        logger.info(
+            "App-Audio-Diagnose Stop: playback=%s mikrofon=%s",
+            current.default_render.describe(),
+            current.default_capture.describe(),
+        )
+        self._log_capture_change("bis zum Stop", current)
+
+    def _safe_read_state(self) -> AudioSystemStateSnapshot:
+        try:
+            return self._reader.read_default_state()
+        except Exception as exc:
+            captured_at = datetime.now()
+            logger.warning("Audio-Endpunkt-Diagnose fehlgeschlagen: %s", exc)
+            return WindowsAudioEndpointStateReader._unavailable_state(captured_at, str(exc))
+
+    def _log_capture_change(self, phase: str, current: AudioSystemStateSnapshot) -> None:
+        if self._initial is None:
+            return
+        baseline = self._initial.default_capture
+        capture = current.default_capture
+        if not capture.has_level_or_mute_change(baseline):
+            return
+
+        signature = capture.change_signature(baseline)
+        if signature == self._last_change_signature:
+            return
+        self._last_change_signature = signature
+        logger.warning(
+            "System-Mikrofonzustand hat sich %s geaendert, ohne dass LoopScribe "
+            "eine Mikrofon-Lautstaerkeaenderung angefordert hat. vorher=%s aktuell=%s",
+            phase,
+            baseline.describe(),
+            capture.describe(),
+        )
+
+
+class _GUID(ctypes.Structure):
+    _fields_ = [
+        ("Data1", ctypes.c_uint32),
+        ("Data2", ctypes.c_uint16),
+        ("Data3", ctypes.c_uint16),
+        ("Data4", ctypes.c_ubyte * 8),
+    ]
+
+    @classmethod
+    def from_string(cls, value: str) -> "_GUID":
+        parsed = UUID(value)
+        return cls(
+            parsed.time_low,
+            parsed.time_mid,
+            parsed.time_hi_version,
+            (ctypes.c_ubyte * 8)(*parsed.bytes[8:]),
+        )
+
+
+_HRESULT = ctypes.c_long
+_CLSCTX_ALL = 23
+_COINIT_APARTMENTTHREADED = 0x2
+_RPC_E_CHANGED_MODE = 0x80010106
+_COM_FUNCTYPE = getattr(ctypes, "WINFUNCTYPE", ctypes.CFUNCTYPE)
+
+
+class _CoreAudioComSession:
+    def __init__(self) -> None:
+        self._needs_uninitialize = False
+
+    def __enter__(self) -> "_CoreAudioComSession":
+        ole32 = _ole32()
+        hr = ole32.CoInitializeEx(None, _COINIT_APARTMENTTHREADED)
+        normalized = _normalize_hresult(hr)
+        if hr in (0, 1):
+            self._needs_uninitialize = True
+        elif normalized == _RPC_E_CHANGED_MODE:
+            self._needs_uninitialize = False
+        else:
+            _check_hresult(hr, "CoInitializeEx")
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        if self._needs_uninitialize:
+            _ole32().CoUninitialize()
+
+
+def _ole32():
+    ole32 = ctypes.WinDLL("ole32")
+    ole32.CoInitializeEx.argtypes = [ctypes.c_void_p, wintypes.DWORD]
+    ole32.CoInitializeEx.restype = _HRESULT
+    ole32.CoUninitialize.argtypes = []
+    ole32.CoUninitialize.restype = None
+    ole32.CoCreateInstance.argtypes = [
+        ctypes.POINTER(_GUID),
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        ctypes.POINTER(_GUID),
+        ctypes.POINTER(ctypes.c_void_p),
+    ]
+    ole32.CoCreateInstance.restype = _HRESULT
+    ole32.CoTaskMemFree.argtypes = [ctypes.c_void_p]
+    ole32.CoTaskMemFree.restype = None
+    return ole32
+
+
+def _com_method(com_ptr: ctypes.c_void_p, index: int, restype, *argtypes):
+    if not com_ptr or not com_ptr.value:
+        raise RuntimeError("COM-Objekt ist nicht initialisiert.")
+    vtable = ctypes.cast(com_ptr, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p))).contents
+    return _COM_FUNCTYPE(restype, ctypes.c_void_p, *argtypes)(vtable[index])
+
+
+def _release_com_object(com_ptr: ctypes.c_void_p) -> None:
+    if not com_ptr or not com_ptr.value:
+        return
+    try:
+        release = _com_method(com_ptr, 2, ctypes.c_ulong)
+        release(com_ptr)
+    except Exception:
+        logger.debug("COM-Objekt konnte nicht freigegeben werden", exc_info=True)
+
+
+def _read_device_id(device: ctypes.c_void_p) -> str:
+    raw_id = ctypes.c_void_p()
+    get_id = _com_method(device, 5, _HRESULT, ctypes.POINTER(ctypes.c_void_p))
+    hr = get_id(device, ctypes.byref(raw_id))
+    _check_hresult(hr, "IMMDevice.GetId")
+    try:
+        if not raw_id.value:
+            return ""
+        return ctypes.wstring_at(raw_id.value)
+    finally:
+        if raw_id.value:
+            _ole32().CoTaskMemFree(raw_id)
+
+
+def _normalize_hresult(hr: int) -> int:
+    return int(hr) & 0xFFFFFFFF
+
+
+def _check_hresult(hr: int, operation: str) -> None:
+    if hr == 0:
+        return
+    raise OSError(f"{operation} fehlgeschlagen (HRESULT 0x{_normalize_hresult(hr):08X})")
 
 
 class AudioCaptureService:
@@ -302,7 +720,14 @@ class _CombinedCaptureBranch:
 
 
 class AudioCaptureService:
-    def __init__(self, sample_rate: int = 48_000, block_size: int = 2_048) -> None:
+    def __init__(
+        self,
+        sample_rate: int = 48_000,
+        block_size: int = 2_048,
+        audio_state_reader: WindowsAudioEndpointStateReader | None = None,
+    ) -> None:
+        self._meter_lock = threading.Lock()
+        self._meter_levels: dict[str, tuple[float, float]] = {}
         self.sample_rate = sample_rate
         self.block_size = block_size
         self._thread: threading.Thread | None = None
@@ -316,12 +741,46 @@ class AudioCaptureService:
         self._selected_device_id = ""
         self._selected_microphone_device_id = ""
         self._selected_application_audio_session_id = ""
+        self._app_microphone_device = None
         self._combined_devices: tuple[tuple[object, str], tuple[object, str]] | None = None
         self._recording_source = RECORDING_SOURCE_SYSTEM_AUDIO
         self._active_input_name = "WASAPI Loopback"
         self._app_audio_ready_event: threading.Event | None = None
         self._app_audio_process: subprocess.Popen[str] | None = None
         self._app_audio_capability_cache: ApplicationAudioCapability | None = None
+        self._audio_state_reader = audio_state_reader or WindowsAudioEndpointStateReader()
+
+    @property
+    def audio_level(self) -> float:
+        now = time.monotonic()
+        with self._meter_lock:
+            return max((level for level, stamp in self._meter_levels.values()
+                        if now - stamp < 0.3), default=0.0)
+
+    def _update_meter(self, samples, source: str) -> None:
+        if samples.size:
+            level = float(np.max(np.abs(samples)))
+            with self._meter_lock:
+                self._meter_levels[source] = (min(1.0, level), time.monotonic())
+
+    def _poll_app_meter(self, path: Path, previous_size: int) -> int:
+        # The bundled helper writes a 44-byte PCM16 WAV header and permits readers.
+        # Read only the latest bounded block, outside the UI thread.
+        try:
+            with path.open("rb") as stream:
+                header = stream.read(44)
+                if len(header) != 44 or header[20:22] != b"\x01\x00" or header[34:36] != b"\x10\x00":
+                    return previous_size
+                size = stream.seek(0, 2)
+                if size <= max(44, previous_size):
+                    return previous_size
+                length = min(8192, size - 44) // 2 * 2
+                stream.seek(44 + (size - 44) // 2 * 2 - length)
+                samples = np.frombuffer(stream.read(length), dtype="<i2").astype(np.float32) / 32768.0
+                self._update_meter(samples, "app")
+                return size
+        except (OSError, ValueError):
+            return previous_size
 
     @property
     def is_recording(self) -> bool:
@@ -523,8 +982,14 @@ class AudioCaptureService:
                 )
                 combined_input_label = app_audio_session.display_label
 
+            self._app_microphone_device = None
+            if source == RECORDING_SOURCE_APPLICATION_AUDIO and getattr(settings, "application_audio_include_microphone", False):
+                self._app_microphone_device = self._resolve_input_microphone(settings.microphone_device_id)
+
             file_stem = self._build_file_stem(source)
             self._current_output_path = ensure_unique_path(settings.recordings_path(), file_stem, ".wav")
+            with self._meter_lock:
+                self._meter_levels.clear()
             self._frames_written = 0
             self._error = None
             self._recording_source = source
@@ -561,6 +1026,7 @@ class AudioCaptureService:
                 daemon=True,
             )
             self._thread.start()
+            recording_thread = self._thread
             output_path = self._current_output_path
             ready_event = self._app_audio_ready_event
 
@@ -570,12 +1036,18 @@ class AudioCaptureService:
                 process = self._app_audio_process
                 if process is not None and process.poll() is None:
                     process.kill()
+                if recording_thread is not None:
+                    recording_thread.join(timeout=APP_AUDIO_HELPER_STOP_TIMEOUT_SECONDS)
                 with self._lock:
-                    self._thread = None
+                    if recording_thread is self._thread and not recording_thread.is_alive():
+                        self._thread = None
                 raise AudioCaptureError("App-Audio-Aufnahme konnte nicht rechtzeitig gestartet werden.")
             if self._error is not None:
+                if recording_thread is not None:
+                    recording_thread.join(timeout=1.0)
                 with self._lock:
-                    self._thread = None
+                    if recording_thread is self._thread and not recording_thread.is_alive():
+                        self._thread = None
                 raise AudioCaptureError(str(self._error)) from self._error
 
         return output_path
@@ -624,7 +1096,7 @@ class AudioCaptureService:
             )
 
     def _stop_join_timeout_seconds(self) -> float:
-        if self._recording_source != RECORDING_SOURCE_SYSTEM_AUDIO_AND_MICROPHONE:
+        if self._recording_source != RECORDING_SOURCE_SYSTEM_AUDIO_AND_MICROPHONE and self._app_microphone_device is None:
             return SINGLE_STOP_JOIN_TIMEOUT_SECONDS
 
         recorded_seconds = 0.0
@@ -682,6 +1154,7 @@ class AudioCaptureService:
                     while not self._stop_event.is_set():
                         frames = recorder.record(numframes=self.block_size)
                         samples = np.asarray(frames, dtype=np.float32)
+                        self._update_meter(samples, "single")
                         if samples.size == 0:
                             continue
                         audio_file.write(np.clip(samples, -1.0, 1.0))
@@ -702,11 +1175,31 @@ class AudioCaptureService:
     def _capture_application_audio_loop(self) -> None:
         ready_event = self._app_audio_ready_event
         process: subprocess.Popen[str] | None = None
+        state_monitor: AppAudioStateMonitor | None = None
+        microphone_thread = None
+        microphone_branch = None
+        microphone_start = threading.Event()
+        temp_paths = []
         try:
             output_path = self._current_output_path
             if output_path is None:
                 raise AudioCaptureError("Kein Zielspeicherort für die App-Audio-Aufnahme vorhanden.")
+            target_path = output_path
+            if self._app_microphone_device is not None:
+                output_path = ensure_unique_path(target_path.parent, target_path.stem + "_app_source", ".wav")
+                microphone_path = ensure_unique_path(target_path.parent, target_path.stem + "_microphone_source", ".wav")
+                temp_paths = [output_path, microphone_path]
+                microphone_branch = _CombinedCaptureBranch(
+                    source=RECORDING_SOURCE_MICROPHONE,
+                    label=str(self._app_microphone_device.name),
+                    device=self._app_microphone_device,
+                    channel_map=self._build_channel_map(self._app_microphone_device),
+                    output_path=microphone_path,
+                    ready_event=threading.Event(),
+                )
             session = self._resolve_application_audio_session(self._selected_application_audio_session_id)
+            state_monitor = AppAudioStateMonitor(self._audio_state_reader)
+            state_monitor.start(session.display_label, includes_microphone=microphone_branch is not None)
             logger.info(
                 "Starte App-Audio-Helfer: session=%s pid=%s ziel=%s",
                 session.display_label,
@@ -742,9 +1235,24 @@ class AudioCaptureService:
                 raise AudioCaptureError(
                     f"App-Audio-Helfer konnte nicht starten: {first_line or stderr_text or 'keine Rückmeldung'}"
                 )
+            if microphone_branch is not None:
+                microphone_start.set()
+                microphone_thread = threading.Thread(
+                    target=self._capture_combined_branch_loop,
+                    args=(microphone_branch, microphone_start),
+                    name="LoopScribeAppMicrophone", daemon=True,
+                )
+                microphone_thread.start()
+                if not microphone_branch.ready_event.wait(APP_AUDIO_HELPER_TIMEOUT_SECONDS):
+                    raise AudioCaptureError("Mikrofon konnte nicht rechtzeitig gestartet werden.")
+                if microphone_branch.error is not None:
+                    raise microphone_branch.error
             if ready_event is not None:
                 ready_event.set()
 
+            meter_size = 0
+            next_meter_poll = 0.0
+            next_audio_state_poll_at = time.monotonic() + AUDIO_STATE_POLL_INTERVAL_SECONDS
             while not self._stop_event.is_set():
                 return_code = process.poll()
                 if return_code is not None:
@@ -752,6 +1260,13 @@ class AudioCaptureService:
                     raise AudioCaptureError(
                         f"App-Audio-Session wurde während der Aufnahme beendet oder der Helfer ist ausgestiegen (Code {return_code}). {stderr_text}".strip()
                     )
+                now = time.monotonic()
+                if now >= next_meter_poll:
+                    meter_size = self._poll_app_meter(output_path, meter_size)
+                    next_meter_poll = now + 0.1
+                if now >= next_audio_state_poll_at:
+                    state_monitor.poll()
+                    next_audio_state_poll_at = now + AUDIO_STATE_POLL_INTERVAL_SECONDS
                 time.sleep(0.04)
 
             if process.stdin is not None:
@@ -773,9 +1288,19 @@ class AudioCaptureService:
                     f"App-Audio-Aufnahme fehlgeschlagen (Code {process.returncode}). {stderr_text or stdout_text}".strip()
                 )
 
-            info = sf.info(output_path)
+            if microphone_thread is not None:
+                microphone_thread.join(timeout=SINGLE_STOP_JOIN_TIMEOUT_SECONDS)
+                if microphone_thread.is_alive():
+                    raise AudioCaptureError("Mikrofon konnte nicht sauber gestoppt werden.")
+                if microphone_branch.error is not None:
+                    raise microphone_branch.error
+                self._merge_recordings(output_path, microphone_branch.output_path, target_path)
+                self._delete_temp_recordings(temp_paths)
+            info = sf.info(target_path)
             self._frames_written = int(info.frames)
             self._active_input_name = session.display_label
+            if microphone_branch is not None:
+                self._active_input_name += f" + {microphone_branch.label}"
             logger.info(
                 "App-Audio-Aufnahme beendet: session=%s frames=%s samplerate=%s dauer=%.2fs",
                 session.display_label,
@@ -789,6 +1314,18 @@ class AudioCaptureService:
             if ready_event is not None:
                 ready_event.set()
         finally:
+            self._stop_event.set()
+            microphone_start.set()
+            if process is not None and process.poll() is None:
+                try:
+                    process.kill()
+                    process.communicate(timeout=2.0)
+                except (OSError, subprocess.TimeoutExpired):
+                    logger.exception("App-Audio-Helfer konnte nicht bereinigt werden")
+            if microphone_thread is not None:
+                microphone_thread.join(timeout=SINGLE_STOP_JOIN_TIMEOUT_SECONDS)
+            if state_monitor is not None:
+                state_monitor.finish()
             self._last_finished_at = datetime.now()
             self._app_audio_process = None
             logger.info("App-Audio-Aufnahme-Thread beendet")
@@ -974,6 +1511,7 @@ class AudioCaptureService:
                 while not self._stop_event.is_set():
                     frames = recorder.record(numframes=self.block_size)
                     samples = np.asarray(frames, dtype=np.float32)
+                    self._update_meter(samples, branch.source)
                     if samples.size == 0:
                         continue
                     audio_file.write(np.clip(samples, -1.0, 1.0))

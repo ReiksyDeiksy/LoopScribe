@@ -6,7 +6,11 @@ from pathlib import Path
 
 from platformdirs import user_data_dir
 
-APP_NAME = "LoopScribe"
+from .i18n import normalize_ui_language
+
+APP_NAME = "scribe"
+# Keep the established on-disk identity so existing settings and models remain available.
+STORAGE_NAME = "LoopScribe"
 APP_AUTHOR = "Recorder"
 RECORDING_SOURCE_SYSTEM_AUDIO = "system_audio"
 RECORDING_SOURCE_MICROPHONE = "microphone"
@@ -16,7 +20,7 @@ DEFAULT_PUSH_TO_TRANSCRIBE_HOTKEY = "ctrl+alt+space"
 
 
 def application_state_directory() -> Path:
-    root = Path(user_data_dir(APP_NAME, APP_AUTHOR))
+    root = Path(user_data_dir(STORAGE_NAME, APP_AUTHOR))
     root.mkdir(parents=True, exist_ok=True)
     return root
 
@@ -24,7 +28,7 @@ def application_state_directory() -> Path:
 def default_output_directory() -> Path:
     documents = Path.home() / "Documents"
     base_dir = documents if documents.exists() else Path.home()
-    output_dir = base_dir / APP_NAME
+    output_dir = base_dir / STORAGE_NAME
     output_dir.mkdir(parents=True, exist_ok=True)
     return output_dir
 
@@ -56,6 +60,8 @@ class AppSettings:
     microphone_device_id: str = ""
     application_audio_session_id: str = ""
     application_audio_session_label: str = ""
+    application_audio_include_microphone: bool = False
+    ui_language: str = "de"
 
     @classmethod
     def with_defaults(cls) -> "AppSettings":
@@ -112,6 +118,7 @@ class SettingsStore:
                 merged[key] = value
 
         settings = AppSettings(**merged)
+        settings.ui_language = normalize_ui_language(settings.ui_language)
         settings.ensure_directories()
         return settings
 

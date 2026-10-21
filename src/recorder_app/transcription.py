@@ -940,8 +940,15 @@ class TranscriptionService:
                 cpu_threads,
             )
             try:
+                # Installed builds include base; development and other models keep downloading normally.
+                bundled_base = Path(__file__).resolve().parent / "bundled_models" / "base"
+                model_source = (
+                    str(bundled_base)
+                    if model_size == "base" and (bundled_base / "model.bin").is_file()
+                    else model_size
+                )
                 model = WhisperModel(
-                    model_size,
+                    model_source,
                     device="cpu",
                     compute_type=profile.compute_type,
                     cpu_threads=cpu_threads,

@@ -1,19 +1,21 @@
 from __future__ import annotations
 
 import ctypes
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from enum import Enum
 import logging
+import math
 from pathlib import Path
 import sys
 import time
 from ctypes import wintypes
 from uuid import uuid4
 
-from PySide6.QtCore import QEvent, QMimeData, QObject, QThread, QTimer, Qt, Signal
-from PySide6.QtGui import QClipboard, QCloseEvent, QContextMenuEvent, QKeyEvent, QKeySequence, QWheelEvent
+from PySide6.QtCore import QAbstractAnimation, QEasingCurve, QRectF, QVariantAnimation, QEvent, QMimeData, QObject, QThread, QTimer, Qt, Signal
+from PySide6.QtGui import QIcon, QColor, QCursor, QPainter, QPen, QClipboard, QCloseEvent, QContextMenuEvent, QKeyEvent, QKeySequence, QWheelEvent
 from PySide6.QtWidgets import (
+    QAbstractScrollArea,
     QCheckBox,
     QDialog,
     QDialogButtonBox,
@@ -35,10 +37,14 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QSizePolicy,
     QSplitter,
+    QStackedWidget,
+    QLayout,
     QTextBrowser,
     QVBoxLayout,
     QWidget,
     QMenu,
+    QStyle,
+    QStyleOptionButton,
 )
 
 from .audio import (
@@ -60,6 +66,9 @@ from .config import (
     application_state_directory,
 )
 from .hotkeys import GlobalHotkeyManager, HotkeyRegistrationError, keyboard_to_qt_hotkey, normalize_hotkey
+from .dictation import WindowsDictationInput
+from .i18n import UI_LANGUAGES, UiText, normalize_ui_language, translate
+from .help_text import HELP_SECTIONS
 from .transcription import (
     FastTranscriptionService as TranscriptionService,
     FastTranscriptionWorker as TranscriptionWorker,
@@ -75,8 +84,7 @@ from .transcription import (
 
 LANGUAGE_OPTIONS = {
     "Automatisch erkennen": "auto",
-    "Deutsch": "de",
-    "English": "en",
+    **{name: code for code, name in UI_LANGUAGES.items()},
 }
 
 MODEL_OPTIONS = ["tiny", "base", "small", "medium", "large-v3", "turbo"]
@@ -159,6 +167,8 @@ def _win32_clipboard_api():
     kernel32.GlobalUnlock.restype = wintypes.BOOL
     kernel32.GlobalFree.argtypes = [wintypes.HANDLE]
     kernel32.GlobalFree.restype = wintypes.HANDLE
+    kernel32.GlobalSize.argtypes = [wintypes.HANDLE]
+    kernel32.GlobalSize.restype = ctypes.c_size_t
     return user32, kernel32
 
 
@@ -279,10 +289,94 @@ def read_native_windows_clipboard_text(hwnd: int | None = None) -> NativeClipboa
             user32.CloseClipboard()
 
 
+def snapshot_native_windows_clipboard(hwnd: int | None = None) -> dict[int, bytes] | None:
+    """Copy transferable HGLOBAL formats, including text, HTML, DIB and PNG."""
+    if sys.platform != "win32":
+        return None
+    user32, kernel32 = _win32_clipboard_api()
+    opened = False
+    try:
+        _open_windows_clipboard(user32, hwnd)
+        opened = True
+        data = {}
+        format_id = 0
+        total_bytes = 0
+        while True:
+            format_id = user32.EnumClipboardFormats(format_id)
+            if not format_id:
+                break
+            # GDI handles and OLE object descriptors cannot be copied as bytes.
+            if format_id in {2, 3, 9, 14, 0x80, 0x82, 0x83, 0x8E}:
+                continue
+            name = _windows_clipboard_format_name(user32, format_id)
+            if name in {"Ole Private Data", "DataObject", "Object Descriptor", "Link Source Descriptor",
+                        "Embed Source", "Embedded Object", "Link Source"}:
+                continue
+            handle = user32.GetClipboardData(format_id)
+            size = kernel32.GlobalSize(handle) if handle else 0
+            if not size:
+                continue
+            total_bytes += size
+            if total_bytes > 128 * 1024 * 1024:
+                return None
+            pointer = kernel32.GlobalLock(handle)
+            if not pointer:
+                continue
+            try:
+                data[format_id] = ctypes.string_at(pointer, size)
+            finally:
+                kernel32.GlobalUnlock(handle)
+        return data if data or not user32.EnumClipboardFormats(0) else None
+    except Exception:
+        logger.warning("Zwischenablage konnte nicht für die Wiederherstellung gesichert werden", exc_info=True)
+        return None
+    finally:
+        if opened:
+            user32.CloseClipboard()
+
+
+def restore_native_windows_clipboard(data: dict[int, bytes], hwnd: int | None = None) -> bool:
+    user32, kernel32 = _win32_clipboard_api()
+    handles = {}
+    opened = False
+    try:
+        # Allocate before EmptyClipboard, so allocation failure preserves the clipboard.
+        for format_id, payload in data.items():
+            handle = kernel32.GlobalAlloc(GMEM_MOVEABLE, len(payload))
+            if not handle:
+                raise RuntimeError(_win32_error("GlobalAlloc"))
+            handles[format_id] = handle
+            pointer = kernel32.GlobalLock(handle)
+            if not pointer:
+                raise RuntimeError(_win32_error("GlobalLock"))
+            try:
+                ctypes.memmove(pointer, payload, len(payload))
+            finally:
+                kernel32.GlobalUnlock(handle)
+        _open_windows_clipboard(user32, hwnd)
+        opened = True
+        if not user32.EmptyClipboard():
+            raise RuntimeError(_win32_error("EmptyClipboard"))
+        for format_id, handle in list(handles.items()):
+            if not user32.SetClipboardData(format_id, handle):
+                raise RuntimeError(_win32_error("SetClipboardData"))
+            del handles[format_id]  # Windows now owns this handle.
+        return True
+    except Exception:
+        logger.warning("Zwischenablage konnte nicht wiederhergestellt werden", exc_info=True)
+        return False
+    finally:
+        if opened:
+            user32.CloseClipboard()
+        for handle in handles.values():
+            kernel32.GlobalFree(handle)
+
+
 class PushToTranscribeState(Enum):
     IDLE = "idle"
     RECORDING = "recording"
     TRANSCRIBING = "transcribing"
+    INSERTING = "inserting"
 
 
 @dataclass(slots=True)
@@ -290,7 +384,7 @@ class TranscriptionJobContext:
     job_id: str
     audio_path: Path
     cleanup_audio_path: Path | None
-    delete_recorded_audio_after_success: bool
+    delete_recorded_audio_after_transcription: bool
 
 
 PUSH_TO_TRANSCRIBE_TRANSITIONS = {
@@ -299,8 +393,297 @@ PUSH_TO_TRANSCRIBE_TRANSITIONS = {
         PushToTranscribeState.IDLE,
         PushToTranscribeState.TRANSCRIBING,
     },
-    PushToTranscribeState.TRANSCRIBING: {PushToTranscribeState.IDLE},
+    PushToTranscribeState.TRANSCRIBING: {PushToTranscribeState.IDLE, PushToTranscribeState.INSERTING},
+    PushToTranscribeState.INSERTING: {PushToTranscribeState.IDLE},
 }
+
+
+class AudioStatusIndicator(QWidget):
+    """Small status visualization; recording bars always represent measured audio."""
+
+    COLORS = {"ready": "#62d6be", "recording": "#ff777f",
+              "transcribing": "#c2a0ff", "finished": "#83e6b0"}
+    LABELS = {"ready": "Bereit zur Aufnahme", "recording": "Aufnahme läuft",
+              "transcribing": "Wird transkribiert …", "finished": "Transkript fertig"}
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.setFixedSize(220, 46)
+        self._state = "ready"
+        self._level = 0.0
+        self._color = QColor(self.COLORS["ready"])
+        self._fade = QVariantAnimation(self)
+        self._fade.setDuration(180)
+        self._fade.valueChanged.connect(self._set_color)
+        self.setAccessibleName(self.LABELS["ready"])
+
+    def _set_color(self, color) -> None:
+        self._color = color
+        self.update()
+
+    def set_status(self, state: str, level: float = 0.0) -> None:
+        if state != self._state:
+            self._state = state
+            self._fade.stop()
+            self._fade.setStartValue(self._color)
+            self._fade.setEndValue(QColor(self.COLORS[state]))
+            self._fade.start()
+            self.setAccessibleName(self.LABELS[state])
+        target = math.sqrt(max(0.0, min(1.0, level))) if state == "recording" else 0.0
+        self._level += (target - self._level) * (0.65 if target > self._level else 0.25)
+        if state != "ready" or self._level > 0.001:
+            self.update()
+
+    def paintEvent(self, event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(self._color)
+        if self._state == "finished":
+            painter.setPen(QPen(self._color, 2.5, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+            painter.drawLine(12, 23, 20, 30)
+            painter.drawLine(20, 30, 34, 15)
+        else:
+            for index, scale in enumerate((0.45, 0.75, 1.0, 0.75, 0.45)):
+                if self._state == "transcribing":
+                    height = 5 + 15 * (0.5 + 0.5 * math.sin(time.monotonic() * 4 - index * 0.65))
+                else:
+                    height = 5 + 25 * self._level * scale
+                painter.drawRoundedRect(QRectF(5 + index * 8, (46 - height) / 2, 4, height), 2, 2)
+        painter.setPen(self._color)
+        alignment = Qt.AlignmentFlag.AlignVCenter | (
+            Qt.AlignmentFlag.AlignRight if self.layoutDirection() == Qt.LayoutDirection.RightToLeft
+            else Qt.AlignmentFlag.AlignLeft
+        )
+        painter.drawText(QRectF(55, 0, self.width() - 55, 46), alignment, self.LABELS[self._state])
+
+
+class DictationBar(QFrame):
+    """A small, click-through status window that leaves the text field focused."""
+
+    def __init__(self) -> None:
+        super().__init__(None, Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint
+                         | Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.WindowDoesNotAcceptFocus)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.setObjectName("dictationBar")
+        self.setStyleSheet("""
+            QFrame#dictationBar { background: #171d23; border: 1px solid #46515c; border-radius: 12px; }
+            QLabel { color: #a7b3c0; font-family: 'Segoe UI'; font-size: 12px; }
+        """)
+        row = QHBoxLayout(self)
+        row.setContentsMargins(12, 2, 16, 2)
+        row.setSpacing(16)
+        self.indicator = AudioStatusIndicator(self)
+        self.indicator.setFixedWidth(250)
+        self.shortcut = QLabel()
+        self.shortcut.setTextFormat(Qt.TextFormat.PlainText)
+        row.addWidget(self.indicator)
+        row.addWidget(self.shortcut)
+        self.adjustSize()
+
+    def show_near_cursor_screen(self) -> None:
+        screen = QApplication.screenAt(QCursor.pos()) or QApplication.primaryScreen()
+        if screen is not None:
+            area = screen.availableGeometry()
+            self.adjustSize()
+            self.move(area.center().x() - self.width() // 2, area.bottom() - self.height() - 18)
+        self.show()
+
+
+class FadingSourceButton(QPushButton):
+    """Paint state colors without delaying selection or rebuilding stylesheets."""
+
+    def __init__(self, text: str) -> None:
+        super().__init__(text)
+        self._keyboard_focus = False
+        self._colors = tuple(QColor(c) for c in ("#1a1f25", "#46515c", "#e7edf2"))
+        self._fade = QVariantAnimation(self)
+        self._fade.setDuration(140)
+        self._fade.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._fade.valueChanged.connect(self._blend_colors)
+        self._from_colors = self._colors
+        self._to_colors = self._colors
+        self.toggled.connect(self._transition_colors)
+        self.pressed.connect(self._transition_colors)
+        self.released.connect(self._transition_colors)
+
+    def focusInEvent(self, event) -> None:
+        self._keyboard_focus = event.reason() in (
+            Qt.FocusReason.TabFocusReason, Qt.FocusReason.BacktabFocusReason,
+            Qt.FocusReason.ShortcutFocusReason,
+        )
+        super().focusInEvent(event)
+        self.update()
+
+    def mousePressEvent(self, event) -> None:
+        self._keyboard_focus = False
+        super().mousePressEvent(event)
+        self.update()
+
+    def _transition_colors(self, *_args) -> None:
+        if not self.isEnabled():
+            values = ("#171c21", "#303941", "#74808b")
+        elif self.isChecked():
+            values = ("#24403f", "#62d6be", "#78e0ce")
+        elif self.isDown():
+            values = ("#35454c", "#82919e", "#e7edf2")
+        elif self.underMouse():
+            values = ("#29343c", "#82919e", "#e7edf2")
+        else:
+            values = ("#1a1f25", "#46515c", "#e7edf2")
+        target = tuple(QColor(c) for c in values)
+        if target == self._to_colors:
+            return
+        self._fade.stop()
+        self._from_colors = self._colors
+        self._to_colors = target
+        if not self.isVisible():
+            self._colors = target
+            self.update()
+            return
+        self._fade.setStartValue(0.0)
+        self._fade.setEndValue(1.0)
+        self._fade.start()
+
+    def _blend_colors(self, value) -> None:
+        self._colors = tuple(
+            QColor.fromRgbF(*(a + (b - a) * float(value)
+                              for a, b in zip(start.getRgbF(), end.getRgbF())))
+            for start, end in zip(self._from_colors, self._to_colors)
+        )
+        self.update()
+
+    def enterEvent(self, event) -> None:
+        super().enterEvent(event)
+        self._transition_colors()
+
+    def leaveEvent(self, event) -> None:
+        super().leaveEvent(event)
+        self._transition_colors()
+
+    def changeEvent(self, event) -> None:
+        super().changeEvent(event)
+        if event.type() == QEvent.Type.EnabledChange and hasattr(self, "_fade"):
+            self._transition_colors()
+
+    def paintEvent(self, event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        background, border, text = self._colors
+        painter.setBrush(background)
+        painter.setPen(QPen(border, 1))
+        painter.drawRoundedRect(QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5), 7, 7)
+        painter.setPen(text)
+        painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, self.text())
+        if self.hasFocus() and self._keyboard_focus:
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.setPen(QPen(QColor("#b9c6d2"), 1))
+            painter.drawRoundedRect(QRectF(self.rect()).adjusted(4, 4, -4, -4), 4, 4)
+
+
+class ToggleCheckBox(QCheckBox):
+    """Animate the thumb while preserving native checkbox input and semantics."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._thumb_position = float(self.isChecked())
+        self._slide = QVariantAnimation(self)
+        self._slide.setDuration(160)
+        self._slide.setEasingCurve(QEasingCurve.Type.InOutCubic)
+        self._slide.valueChanged.connect(self._update_thumb)
+        self.toggled.connect(self._animate_toggle)
+
+    def _update_thumb(self, value) -> None:
+        self._thumb_position = float(value)
+        self.update()
+
+    def _animate_toggle(self, checked: bool) -> None:
+        self._slide.stop()
+        target = float(checked)
+        if not self.isVisible():
+            self._update_thumb(target)
+            return
+        self._slide.setStartValue(self._thumb_position)
+        self._slide.setEndValue(target)
+        self._slide.start()
+
+    def _thumb_rect(self) -> QRectF:
+        option = QStyleOptionButton()
+        self.initStyleOption(option)
+        indicator = self.style().subElementRect(QStyle.SubElement.SE_CheckBoxIndicator, option, self)
+        position = self._thumb_position
+        if self.layoutDirection() == Qt.LayoutDirection.RightToLeft:
+            position = 1.0 - position
+        return QRectF(indicator.left() + 3 + 14 * position,
+                      indicator.top() + (indicator.height() - 14) / 2, 14, 14)
+
+    def paintEvent(self, event) -> None:
+        super().paintEvent(event)
+        if self._slide.state() != QAbstractAnimation.State.Running:
+            # Settings may be synchronized with checkbox signals temporarily blocked.
+            self._thumb_position = float(self.isChecked())
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor("#f0fffb" if self.isEnabled() else "#89969f"))
+        painter.drawEllipse(self._thumb_rect())
+
+
+class SmoothWheelScroll(QObject):
+    """Animate wheel notches; leave native touchpad pixel scrolling intact."""
+
+    def __init__(self, area: QAbstractScrollArea) -> None:
+        super().__init__(area)
+        self.area = area
+        self.animations = {}
+        for bar in (area.verticalScrollBar(), area.horizontalScrollBar()):
+            animation = QVariantAnimation(self)
+            animation.setDuration(160)
+            animation.setEasingCurve(QEasingCurve.Type.OutCubic)
+            animation.valueChanged.connect(lambda value, b=bar: b.setValue(round(value)))
+            bar.sliderPressed.connect(animation.stop)
+            bar.actionTriggered.connect(lambda _action, a=animation: a.stop())
+            bar.rangeChanged.connect(lambda _low, _high, a=animation: a.stop())
+            bar.installEventFilter(self)
+            self.animations[bar] = animation
+        area.installEventFilter(self)
+        area.viewport().installEventFilter(self)
+
+    def eventFilter(self, watched, event) -> bool:
+        if event.type() in (QEvent.Type.KeyPress, QEvent.Type.MouseButtonPress, QEvent.Type.Hide):
+            for animation in self.animations.values():
+                animation.stop()
+        if event.type() != QEvent.Type.Wheel:
+            return False
+        if not event.pixelDelta().isNull() or event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            for animation in self.animations.values():
+                animation.stop()
+            return False
+        delta = event.angleDelta()
+        horizontal = bool(delta.x()) or bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier)
+        bar = self.area.horizontalScrollBar() if horizontal else self.area.verticalScrollBar()
+        if watched in self.animations:
+            bar = watched
+        amount = delta.x() if delta.x() else delta.y()
+        if not amount or not bar.isEnabled():
+            return False
+        animation = self.animations[bar]
+        current = bar.value()
+        target = float(animation.endValue()) if animation.state() == QAbstractAnimation.State.Running else current
+        distance = -amount / 120 * QApplication.wheelScrollLines() * bar.singleStep()
+        # A reversal responds from the visible position instead of finishing queued motion.
+        if (target - current) * distance < 0:
+            target = current
+        target = max(bar.minimum(), min(bar.maximum(), target + distance))
+        animation.stop()
+        if target != current:
+            animation.setStartValue(float(current))
+            animation.setEndValue(float(target))
+            animation.start()
+        event.accept()
+        return True
 
 
 class WheelGuardComboBox(QComboBox):
@@ -317,6 +700,10 @@ class IsolatedWheelPlainTextEdit(QPlainTextEdit):
     """Keep transcript scrolling from bubbling into parent scroll areas."""
 
     copy_requested = Signal(str)
+
+    @staticmethod
+    def translate_ui(source: str) -> str:
+        return source
 
     def _selected_clipboard_text(self) -> str:
         cursor = self.textCursor()
@@ -338,11 +725,11 @@ class IsolatedWheelPlainTextEdit(QPlainTextEdit):
 
     def contextMenuEvent(self, event: QContextMenuEvent) -> None:
         menu = QMenu(self)
-        copy_action = menu.addAction("Kopieren")
+        copy_action = menu.addAction(self.translate_ui("Kopieren"))
         copy_action.setEnabled(self.textCursor().hasSelection())
         copy_action.triggered.connect(self.copy)
         menu.addSeparator()
-        select_all_action = menu.addAction("Alles auswählen")
+        select_all_action = menu.addAction(self.translate_ui("Alles auswählen"))
         select_all_action.triggered.connect(self.selectAll)
         menu.exec(event.globalPos())
 
@@ -380,6 +767,8 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.settings_store = settings_store
         self.settings = self.settings_store.load()
+        self.ui_language = normalize_ui_language(self.settings.ui_language)
+        self._ui_text_bindings = {}
 
         self.audio_service = AudioCaptureService()
         self.hotkey_manager = GlobalHotkeyManager()
@@ -398,6 +787,21 @@ class MainWindow(QMainWindow):
         self.transcription_cancel_requested = False
         self.transcription_auto_clipboard_requested = False
         self.push_to_transcribe_state = PushToTranscribeState.IDLE
+        self.dictation_input = WindowsDictationInput()
+        self._dictation_target = None
+        self._pending_dictation_text: str | None = None
+        self._dictation_insert_deadline = 0.0
+        self._dictation_feedback = "Push: bereit"
+        self._dictation_feedback_until = 0.0
+        self._clipboard_restore_data = None
+        self._clipboard_restore_sequence = 0
+        self.dictation_insert_timer = QTimer(self)
+        self.dictation_insert_timer.setInterval(50)
+        self.dictation_insert_timer.timeout.connect(self._try_insert_dictation)
+        self.clipboard_restore_timer = QTimer(self)
+        self.clipboard_restore_timer.setSingleShot(True)
+        self.clipboard_restore_timer.timeout.connect(self._restore_dictation_clipboard)
+        self.dictation_bar = DictationBar()
         self.available_audio_devices: list[LoopbackDeviceInfo] = []
         self.available_microphone_devices: list[MicrophoneDeviceInfo] = []
         self.available_app_audio_sessions: list[ApplicationAudioSessionInfo] = []
@@ -408,6 +812,9 @@ class MainWindow(QMainWindow):
 
         self._build_ui()
         self._apply_style()
+        for area in self.findChildren(QAbstractScrollArea):
+            if isinstance(area, (QScrollArea, QPlainTextEdit, QTextBrowser)):
+                SmoothWheelScroll(area)
         self._install_log_handler()
         self.reload_audio_devices(show_feedback=False)
         self.reload_microphone_devices(show_feedback=False)
@@ -418,252 +825,125 @@ class MainWindow(QMainWindow):
         self._refresh_actions()
         self._apply_recording_source_to_ui()
         self._warn_if_saved_device_missing()
+        self._apply_ui_language()
+        self.dictation_bar.show_near_cursor_screen()
+
+    def _tr(self, source: str, **values: object) -> str:
+        return translate(self.ui_language, source, **values)
+
+    def _set_ui_text(self, widget, source: str, setter: str = "setText", **values: object) -> None:
+        """Remember UI templates so language changes never rebuild the workspace."""
+        self._ui_text_bindings[(widget, setter)] = (source, values)
+        getattr(widget, setter)(self._tr(source, **values))
+
+    def _text_widget(self, widget_type, source: str):
+        widget = widget_type("")
+        self._set_ui_text(widget, source)
+        return widget
+
+    def _apply_ui_language(self, *_args) -> None:
+        self.ui_language = normalize_ui_language(str(self.ui_language_combo.currentData()))
+        self.setLayoutDirection(Qt.LayoutDirection.RightToLeft if self.ui_language == "ar"
+                                else Qt.LayoutDirection.LeftToRight)
+        self.dictation_bar.setLayoutDirection(self.layoutDirection())
+        self.dictation_bar.shortcut.setLayoutDirection(Qt.LayoutDirection.LeftToRight)
+        # Paths and keyboard sequences keep their natural, unambiguous direction.
+        for widget in (self.storage_input, self.start_hotkey_edit, self.stop_hotkey_edit,
+                       self.push_to_transcribe_hotkey_edit, self.recording_value):
+            widget.setLayoutDirection(Qt.LayoutDirection.LeftToRight)
+        for (widget, setter), (source, values) in self._ui_text_bindings.items():
+            getattr(widget, setter)(self._tr(source, **values))
+        for combo, options in (
+            (self.language_combo, LANGUAGE_OPTIONS),
+            (self.recording_source_combo, RECORDING_SOURCE_OPTIONS),
+            (self.performance_profile_combo, TRANSCRIPTION_PROFILE_OPTIONS),
+            (self.transcript_format_combo, TRANSCRIPT_FORMAT_OPTIONS),
+            (self.audio_device_combo, {"Standard-Wiedergabegerät": ""}),
+            (self.microphone_device_combo, {"Standard-Mikrofon": ""}),
+            (self.app_audio_session_combo, {"Keine App-Audio-Session ausgewählt": ""}),
+        ):
+            blocked = combo.blockSignals(True)
+            try:
+                for source, code in options.items():
+                    index = combo.findData(code)
+                    if index >= 0:
+                        combo.setItemText(index, self._tr(source))
+            finally:
+                combo.blockSignals(blocked)
+        self.audio_status.LABELS = {
+            state: self._tr(source) for state, source in AudioStatusIndicator.LABELS.items()
+        }
+        self.audio_status.setAccessibleName(self.audio_status.LABELS[self.audio_status._state])
+        self.audio_status.setFixedWidth(max(
+            220, 65 + max(self.audio_status.fontMetrics().horizontalAdvance(text)
+                          for text in self.audio_status.LABELS.values())
+        ))
+        self.audio_status.update()
+        self._update_settings_summary()
+        self._refresh_actions()
 
     def _build_ui(self) -> None:
-        self.setWindowTitle(f"{APP_NAME} - Systemaudio Transkription")
-        self.resize(1440, 900)
-        self.setMinimumSize(1120, 720)
-
-        root = QWidget(self)
+        self.setWindowTitle(APP_NAME)
+        self.setWindowIcon(QIcon(str(Path(__file__).parent / "assets" / "scribe.ico")))
+        self.resize(1440, 960)
+        self.setMinimumSize(1000, 720)
+        root = QWidget()
         root.setObjectName("appRoot")
         layout = QVBoxLayout(root)
-        layout.setContentsMargins(18, 18, 18, 18)
-        layout.setSpacing(14)
-
-        hero = QFrame()
-        hero.setObjectName("heroCard")
-        hero_layout = QHBoxLayout(hero)
-        hero_layout.setContentsMargins(22, 18, 22, 18)
-        hero_layout.setSpacing(16)
-
-        hero_copy = QVBoxLayout()
-        hero_copy.setSpacing(8)
-
-        title = QLabel("Systemaudio mitschneiden und lokal transkribieren")
-        title.setObjectName("heroTitle")
-        author_credit = QLabel("by Daniel Marschner")
-        author_credit.setObjectName("heroAuthor")
-        subtitle = QLabel(
-            "Loopback-Aufnahme, globale Hotkeys und lokale Whisper-Transkription "
-            "für Calls, Meetings und Audio-Dateien."
-        )
-        subtitle.setWordWrap(True)
-        subtitle.setObjectName("heroSubtitle")
-        hero_copy.addWidget(title)
-        hero_copy.addWidget(author_credit)
-        hero_copy.addWidget(subtitle)
-
-        hero_badges = QHBoxLayout()
-        hero_badges.setSpacing(8)
-        for badge_text in ("WASAPI Loopback", "Mikrofon", "faster-whisper", "Hotkeys"):
-            badge = QLabel(badge_text)
-            badge.setObjectName("heroBadge")
-            hero_badges.addWidget(badge)
-        hero_badges.addStretch(1)
-        hero_copy.addLayout(hero_badges)
-
-        hero_status = QFrame()
-        hero_status.setObjectName("heroStatusCard")
-        hero_status.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
-        hero_status_layout = QVBoxLayout(hero_status)
-        hero_status_layout.setContentsMargins(18, 14, 18, 14)
-        hero_status_layout.setSpacing(4)
-        hero_status_caption = QLabel("Bereit für Aufnahme")
-        hero_status_caption.setObjectName("heroStatusCaption")
-        hero_status_text = QLabel("Start, Push-to-Transcribe, Import und Export bleiben direkt erreichbar.")
-        hero_status_text.setObjectName("heroStatusText")
-        hero_status_text.setWordWrap(True)
-        hero_status_layout.addWidget(hero_status_caption)
-        hero_status_layout.addWidget(hero_status_text)
-
-        hero_layout.addLayout(hero_copy, 1)
-        hero_layout.addWidget(hero_status)
-
-        splitter = QSplitter(Qt.Orientation.Horizontal)
-        splitter.setObjectName("mainSplitter")
-        splitter.setChildrenCollapsible(False)
-
+        layout.setContentsMargins(28, 12, 28, 16)
+        layout.setSpacing(18)
+        navigation = QHBoxLayout()
+        brand_icon = QLabel()
+        brand_icon.setPixmap(self.windowIcon().pixmap(32, 32))
+        self._set_ui_text(brand_icon, 'scribe: Füllerfeder mit Audiospur', setter='setAccessibleName')
+        navigation.addWidget(brand_icon)
+        brand = QLabel(APP_NAME)
+        brand.setObjectName("brand")
+        navigation.addWidget(brand)
+        navigation.addSpacing(24)
+        self.workspace_button = self._text_widget(QPushButton, 'Arbeitsbereich')
+        self.settings_button = self._text_widget(QPushButton, 'Einstellungen')
+        self.help_button = self._text_widget(QPushButton, 'Hilfe')
+        for button in (self.workspace_button, self.settings_button):
+            button.setCheckable(True)
+            button.setObjectName("navigationButton")
+            navigation.addWidget(button)
+        self.workspace_button.setChecked(True)
+        navigation.addWidget(self.help_button)
+        navigation.addStretch()
+        self.audio_status = AudioStatusIndicator()
+        navigation.addWidget(self.audio_status)
+        layout.addLayout(navigation)
+        self.pages = QStackedWidget()
+        layout.addWidget(self.pages, 1)
         workspace = QWidget()
-        workspace.setObjectName("workspacePanel")
-        workspace_layout = QVBoxLayout(workspace)
-        workspace_layout.setContentsMargins(0, 0, 0, 0)
-        workspace_layout.setSpacing(16)
-
-        controls_group = QGroupBox("Aufnahme und Import")
-        controls_group.setObjectName("panelCard")
-        controls_layout = QVBoxLayout(controls_group)
-        controls_layout.setContentsMargins(18, 46, 18, 18)
-        controls_layout.setSpacing(16)
-
-        button_grid = QGridLayout()
-        button_grid.setContentsMargins(0, 0, 0, 0)
-        button_grid.setHorizontalSpacing(10)
-        button_grid.setVerticalSpacing(10)
-        self.start_button = QPushButton("Aufnahme starten")
-        self.start_button.setObjectName("primaryButton")
-        self.stop_button = QPushButton("Aufnahme stoppen")
-        self.stop_button.setObjectName("dangerButton")
-        self.import_button = QPushButton("Audio-Datei importieren")
-        self.import_button.setObjectName("secondaryButton")
-        self.export_button = QPushButton("Transkript exportieren")
-        self.export_button.setObjectName("secondaryButton")
-        self.cancel_button = QPushButton("Transkription abbrechen")
-        self.cancel_button.setObjectName("dangerButton")
-        self.help_button = QPushButton("Hilfe")
-        self.help_button.setObjectName("ghostButton")
-        for action_button in (
-            self.start_button,
-            self.stop_button,
-            self.import_button,
-            self.export_button,
-            self.cancel_button,
-            self.help_button,
-        ):
-            action_button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        button_grid.addWidget(self.start_button, 0, 0)
-        button_grid.addWidget(self.stop_button, 0, 1)
-        button_grid.addWidget(self.import_button, 1, 0)
-        button_grid.addWidget(self.export_button, 1, 1)
-        button_grid.addWidget(self.cancel_button, 2, 0)
-        button_grid.addWidget(self.help_button, 2, 1)
-        button_grid.setColumnStretch(0, 1)
-        button_grid.setColumnStretch(1, 1)
-        controls_layout.addLayout(button_grid)
-
-        info_group = QFrame()
-        info_group.setObjectName("statusBoard")
-        info_group.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        info_layout = QGridLayout(info_group)
-        info_layout.setContentsMargins(14, 12, 14, 12)
-        info_layout.setHorizontalSpacing(18)
-        info_layout.setVerticalSpacing(4)
-
-        self.status_value = QLabel("Bereit")
-        self.status_value.setObjectName("metricValue")
-        self.status_value.setWordWrap(True)
-        self.push_to_transcribe_value = QLabel("Bereit")
-        self.push_to_transcribe_value.setObjectName("metricValue")
-        self.push_to_transcribe_value.setWordWrap(True)
-        self.source_value = QLabel("Noch keine Aufnahme oder importierte Datei.")
-        self.source_value.setObjectName("metricValueSmall")
-        self.source_value.setWordWrap(True)
-        self.recording_value = QLabel("00:00")
-        self.recording_value.setObjectName("metricValue")
-        self.autosave_value = QLabel("Wird nach der ersten Transkription angezeigt.")
-        self.autosave_value.setObjectName("metricValueSmall")
-        self.autosave_value.setWordWrap(True)
-
-        def add_metric(row: int, column: int, caption_text: str, value_label: QLabel, column_span: int = 1) -> None:
-            caption = QLabel(caption_text)
-            caption.setObjectName("metricCaption")
-            caption.setSizePolicy(QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed)
-            value_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-            info_layout.addWidget(caption, row, column, 1, column_span)
-            info_layout.addWidget(value_label, row + 1, column, 1, column_span)
-
-        add_metric(0, 0, "Status", self.status_value)
-        add_metric(0, 1, "Push-to-Transcribe", self.push_to_transcribe_value)
-        add_metric(0, 2, "Dauer", self.recording_value)
-        add_metric(2, 0, "Quelle", self.source_value, 3)
-        add_metric(4, 0, "Auto-Save", self.autosave_value, 3)
-        info_layout.setColumnStretch(0, 1)
-        info_layout.setColumnStretch(1, 1)
-        info_layout.setColumnStretch(2, 1)
-        controls_layout.addWidget(info_group)
-
-        progress_group = QGroupBox("Transkriptionsfortschritt")
-        progress_group.setObjectName("panelCard")
-        progress_layout = QVBoxLayout(progress_group)
-        progress_layout.setContentsMargins(18, 46, 18, 18)
-        progress_layout.setSpacing(12)
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setRange(0, 100)
-        self.progress_bar.setValue(0)
-        self.progress_detail = QLabel("Noch keine Transkription gestartet.")
-        self.progress_detail.setWordWrap(True)
-        self.error_label = QLabel()
-        self.error_label.setWordWrap(True)
-        self.error_label.setObjectName("errorBanner")
-        self.error_label.hide()
-        progress_layout.addWidget(self.progress_bar)
-        progress_layout.addWidget(self.progress_detail)
-        progress_layout.addWidget(self.error_label)
-
-        transcript_group = QGroupBox("Transkript")
-        transcript_group.setObjectName("transcriptPanel")
-        transcript_layout = QVBoxLayout(transcript_group)
-        transcript_layout.setContentsMargins(18, 46, 18, 18)
-        transcript_layout.setSpacing(12)
-        transcript_action_row = QHBoxLayout()
-        transcript_action_row.setSpacing(10)
-        transcript_hint = QLabel("Erkannter Text")
-        transcript_hint.setObjectName("sectionHint")
-        transcript_action_row.addWidget(transcript_hint)
-        transcript_action_row.addStretch(1)
-        self.copy_transcript_button = QPushButton("Transkript kopieren")
-        self.copy_transcript_button.setObjectName("secondaryButton")
-        self.copy_transcript_button.setSizePolicy(QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed)
-        self.copy_transcript_button.setToolTip(
-            "Kopiert den kompletten sichtbaren Transkripttext in die Zwischenablage."
-        )
-        transcript_action_row.addWidget(self.copy_transcript_button)
-        transcript_layout.addLayout(transcript_action_row)
-        self.transcript_edit = IsolatedWheelPlainTextEdit()
-        self.transcript_edit.setPlaceholderText(
-            "Hier erscheint die Transkription mit Zeitmarken. "
-            "Der Text kann vor dem Export noch angepasst werden."
-        )
-        self.transcript_edit.setReadOnly(False)
-        self.transcript_edit.setObjectName("transcriptEditor")
-        self.transcript_edit.setUndoRedoEnabled(True)
-        self.transcript_edit.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
-        self.transcript_edit.setContextMenuPolicy(Qt.ContextMenuPolicy.DefaultContextMenu)
-        self.transcript_edit.setTextInteractionFlags(Qt.TextInteractionFlag.TextEditorInteraction)
-        self.transcript_edit.setMinimumHeight(150)
-        transcript_layout.addWidget(self.transcript_edit)
-
-        workspace_layout.addWidget(controls_group)
-        workspace_layout.addWidget(progress_group)
-        workspace_layout.addWidget(transcript_group, 1)
-
-        workspace_scroll = QScrollArea()
-        workspace_scroll.setObjectName("workspaceScroll")
-        workspace_scroll.setWidgetResizable(True)
-        workspace_scroll.setFrameShape(QFrame.Shape.NoFrame)
-        workspace_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        workspace_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        workspace_scroll.viewport().setObjectName("workspaceViewport")
-        workspace_scroll.setWidget(workspace)
-
+        work = QVBoxLayout(workspace)
+        work.setContentsMargins(0, 0, 0, 0)
+        work.setSpacing(16)
+        work.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
+        title = self._text_widget(QLabel, 'Neue Aufnahme')
+        title.setObjectName("pageTitle")
+        work.addWidget(title)
+        self.source_description = self._text_widget(QLabel, 'Audio aufnehmen und lokal transkribieren')
+        self.source_description.setObjectName("mutedLabel")
+        work.addWidget(self.source_description)
         settings_panel = QScrollArea()
-        settings_panel.setObjectName("sideScroll")
         settings_panel.setWidgetResizable(True)
         settings_panel.setFrameShape(QFrame.Shape.NoFrame)
-        settings_panel.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        settings_panel.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-
         settings_content = QWidget()
-        settings_content.setObjectName("sidePanel")
-        settings_layout = QVBoxLayout(settings_content)
-        settings_layout.setContentsMargins(0, 0, 0, 0)
-        settings_layout.setSpacing(16)
-
-        settings_group = QGroupBox("Einstellungen")
-        settings_group.setObjectName("panelCard")
-        settings_form = QVBoxLayout(settings_group)
-        settings_form.setContentsMargins(18, 46, 18, 18)
-        settings_form.setSpacing(10)
+        settings_form = QVBoxLayout(settings_content)
+        settings_form.setContentsMargins(24, 12, 24, 24)
+        settings_form.setSpacing(12)
+        settings_title = self._text_widget(QLabel, 'Einstellungen')
+        settings_title.setObjectName("pageTitle")
+        settings_form.addWidget(settings_title)
 
         def add_setting(label_text: str, widget: QWidget) -> None:
-            label = QLabel(label_text)
-            label.setObjectName("fieldLabel")
-            label.setWordWrap(True)
-            settings_form.addWidget(label)
+            settings_form.addWidget(self._text_widget(QLabel, label_text))
             settings_form.addWidget(widget)
 
         def wrap_inline_layout(inline_layout: QHBoxLayout) -> QWidget:
             wrapper = QWidget()
-            wrapper.setObjectName("inlineField")
             inline_layout.setContentsMargins(0, 0, 0, 0)
             wrapper.setLayout(inline_layout)
             return wrapper
@@ -672,7 +952,7 @@ class MainWindow(QMainWindow):
         storage_row.setSpacing(8)
         self.storage_input = QLineEdit()
         self.storage_input.setClearButtonEnabled(True)
-        self.storage_button = QPushButton("Ordner wählen")
+        self.storage_button = self._text_widget(QPushButton, 'Ordner wählen')
         self.storage_button.setObjectName("secondaryButton")
         self.storage_button.setSizePolicy(QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed)
         storage_row.addWidget(self.storage_input, 1)
@@ -682,6 +962,11 @@ class MainWindow(QMainWindow):
         for label, code in LANGUAGE_OPTIONS.items():
             self.language_combo.addItem(label, code)
 
+        self.ui_language_combo = WheelGuardComboBox()
+        for code, label in UI_LANGUAGES.items():
+            self.ui_language_combo.addItem(label, code)
+        self._set_combo_data(self.ui_language_combo, self.ui_language)
+
         self.model_combo = WheelGuardComboBox()
         for model in MODEL_OPTIONS:
             self.model_combo.addItem(model, model)
@@ -689,25 +974,17 @@ class MainWindow(QMainWindow):
         self.performance_profile_combo = WheelGuardComboBox()
         for label, profile_key in TRANSCRIPTION_PROFILE_OPTIONS.items():
             self.performance_profile_combo.addItem(label, profile_key)
-        self.performance_profile_combo.setToolTip(
-            "Schnell reduziert CPU-Last. Ausgewogen und Qualität nutzen mehr Suchbreite und können länger dauern."
-        )
+        self._set_ui_text(self.performance_profile_combo, 'Schnell reduziert CPU-Last. Ausgewogen und Qualität nutzen mehr Suchbreite und können länger dauern.', setter='setToolTip')
 
-        self.timestamps_checkbox = QCheckBox("Timestamps anzeigen")
+        self.timestamps_checkbox = self._text_widget(ToggleCheckBox, 'Timestamps anzeigen')
         self.timestamps_checkbox.setChecked(True)
         self.transcript_format_combo = WheelGuardComboBox()
         for label, format_key in TRANSCRIPT_FORMAT_OPTIONS.items():
             self.transcript_format_combo.addItem(label, format_key)
-        self.transcript_format_combo.setToolTip(
-            "Kompakt verbindet Whisper-Segmente ohne AI-Umschreibung zu natürlicheren Absätzen."
-        )
-        self.cleanup_recordings_checkbox = QCheckBox(
-            "Aufnahmen nach Transkription löschen"
-        )
+        self._set_ui_text(self.transcript_format_combo, 'Kompakt verbindet Whisper-Segmente ohne AI-Umschreibung zu natürlicheren Absätzen.', setter='setToolTip')
+        self.cleanup_recordings_checkbox = self._text_widget(ToggleCheckBox, 'Aufnahmen nach Transkription löschen')
         self.cleanup_recordings_checkbox.setChecked(True)
-        self.cleanup_recordings_checkbox.setToolTip(
-            "Gilt nur für von der App erstellte WAV-Aufnahmen. Importierte Dateien bleiben erhalten."
-        )
+        self._set_ui_text(self.cleanup_recordings_checkbox, 'Löscht app-eigene WAV-Aufnahmen auch bei Abbruch oder Fehlern der Transkription. Importierte Dateien bleiben erhalten.', setter='setToolTip')
 
         self.recording_source_combo = WheelGuardComboBox()
         for label, value in RECORDING_SOURCE_OPTIONS.items():
@@ -716,7 +993,7 @@ class MainWindow(QMainWindow):
         audio_device_row = QHBoxLayout()
         audio_device_row.setSpacing(8)
         self.audio_device_combo = WheelGuardComboBox()
-        self.refresh_devices_button = QPushButton("Loopback aktualisieren")
+        self.refresh_devices_button = self._text_widget(QPushButton, 'Loopback aktualisieren')
         self.refresh_devices_button.setObjectName("secondaryButton")
         self.refresh_devices_button.setSizePolicy(QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed)
         audio_device_row.addWidget(self.audio_device_combo, 1)
@@ -725,7 +1002,7 @@ class MainWindow(QMainWindow):
         microphone_device_row = QHBoxLayout()
         microphone_device_row.setSpacing(8)
         self.microphone_device_combo = WheelGuardComboBox()
-        self.refresh_microphones_button = QPushButton("Mikrofone aktualisieren")
+        self.refresh_microphones_button = self._text_widget(QPushButton, 'Mikrofone aktualisieren')
         self.refresh_microphones_button.setObjectName("secondaryButton")
         self.refresh_microphones_button.setSizePolicy(QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed)
         microphone_device_row.addWidget(self.microphone_device_combo, 1)
@@ -734,421 +1011,308 @@ class MainWindow(QMainWindow):
         app_audio_row = QHBoxLayout()
         app_audio_row.setSpacing(8)
         self.app_audio_session_combo = WheelGuardComboBox()
-        self.refresh_app_audio_button = QPushButton("Apps aktualisieren")
+        self.refresh_app_audio_button = self._text_widget(QPushButton, 'Apps aktualisieren')
         self.refresh_app_audio_button.setObjectName("secondaryButton")
         self.refresh_app_audio_button.setSizePolicy(QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed)
         app_audio_row.addWidget(self.app_audio_session_combo, 1)
         app_audio_row.addWidget(self.refresh_app_audio_button)
-        self.app_audio_hint = QLabel("App-Audio wird nur angezeigt, wenn echte Windows-Audio-Sessions erkannt werden.")
+        self.app_audio_hint = self._text_widget(QLabel, 'App-Audio wird nur angezeigt, wenn echte Windows-Audio-Sessions erkannt werden.')
         self.app_audio_hint.setWordWrap(True)
         self.app_audio_hint.setObjectName("mutedLabel")
 
         self.start_hotkey_edit = QKeySequenceEdit()
         self.stop_hotkey_edit = QKeySequenceEdit()
         self.push_to_transcribe_hotkey_edit = QKeySequenceEdit()
-        hotkey_hint = QLabel(
-            "Tipp: Wird derselbe Start/Stopp-Hotkey gesetzt, arbeitet die App als Toggle. "
-            "Push-to-Transcribe startet beim Drücken und stoppt beim Loslassen."
-        )
+        hotkey_hint = self._text_widget(QLabel, 'Tipp: Wird derselbe Start/Stopp-Hotkey gesetzt, arbeitet die App als Toggle. Push-to-Transcribe startet beim Drücken und stoppt beim Loslassen.')
         hotkey_hint.setWordWrap(True)
         hotkey_hint.setObjectName("mutedLabel")
 
+
+        self.recording_source_combo.setParent(root)
+        self.recording_source_combo.hide()
+        self.app_audio_microphone_checkbox = self._text_widget(ToggleCheckBox, 'Mikrofon mit aufnehmen')
+        self.system_microphone_checkbox = self._text_widget(ToggleCheckBox, 'Mikrofon mit aufnehmen')
+        self.system_microphone_checkbox.toggled.connect(self._toggle_system_microphone)
+        recording_card = QFrame()
+        recording_card.setObjectName("panelCard")
+        recording_card.setMinimumHeight(300)
+        recording_card.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+        recording = QVBoxLayout(recording_card)
+        recording.setContentsMargins(22, 20, 22, 20)
+        recording.setSpacing(16)
+        source_row = QHBoxLayout()
+        self.source_buttons = {}
+        for label, source in (("Systemaudio", RECORDING_SOURCE_SYSTEM_AUDIO),
+                              ("Mikrofon", RECORDING_SOURCE_MICROPHONE),
+                              ("App-Audio", RECORDING_SOURCE_APPLICATION_AUDIO)):
+            button = self._text_widget(FadingSourceButton, label)
+            button.setCheckable(True)
+            button.setMinimumHeight(48)
+            button.setObjectName("sourceButton")
+            button.clicked.connect(lambda checked=False, value=source: self._select_source(value))
+            self.source_buttons[source] = button
+            source_row.addWidget(button)
+        recording.addLayout(source_row)
+        devices = QHBoxLayout()
+        devices.setSpacing(28)
+        self.output_fields = QWidget()
+        output_fields = QVBoxLayout(self.output_fields)
+        output_fields.setContentsMargins(0, 0, 0, 0)
+        self.app_fields = QWidget()
+        app_fields = QVBoxLayout(self.app_fields)
+        app_fields.setContentsMargins(0, 0, 0, 0)
+        app_fields.addWidget(self._text_widget(QLabel, 'App'))
+        app_fields.addWidget(wrap_inline_layout(app_audio_row))
+        self.system_fields = QWidget()
+        system_fields = QVBoxLayout(self.system_fields)
+        system_fields.setContentsMargins(0, 0, 0, 0)
+        system_fields.addWidget(self._text_widget(QLabel, 'Wiedergabegerät'))
+        system_fields.addWidget(wrap_inline_layout(audio_device_row))
+        output_fields.addWidget(self.app_fields)
+        output_fields.addWidget(self.system_fields)
+        output_fields.addStretch()
+        devices.addWidget(self.output_fields, 1)
+        microphone_fields = QVBoxLayout()
+        microphone_fields.addWidget(self.app_audio_microphone_checkbox)
+        microphone_fields.addWidget(self.system_microphone_checkbox)
+        microphone_fields.addWidget(self._text_widget(QLabel, 'Mikrofon'))
+        microphone_fields.addWidget(wrap_inline_layout(microphone_device_row))
+        self.mix_hint = self._text_widget(QLabel, 'Beide Quellen landen in einer Audiodatei.')
+        self.mix_hint.setObjectName("mutedLabel")
+        microphone_fields.addWidget(self.mix_hint)
+        devices.addLayout(microphone_fields, 1)
+        recording.addLayout(devices)
+        recording.addWidget(self.app_audio_hint)
+        actions = QHBoxLayout()
+        self.start_button = self._text_widget(QPushButton, '●  Aufnahme starten')
+        self.start_button.setObjectName("primaryButton")
+        self.stop_button = self._text_widget(QPushButton, '■  Aufnahme stoppen')
+        self.stop_button.setObjectName("dangerButton")
+        self.import_button = self._text_widget(QPushButton, 'Datei importieren')
+        for button in (self.start_button, self.stop_button, self.import_button):
+            button.setMinimumHeight(46)
+            actions.addWidget(button)
+        actions.addStretch()
+        self.status_value = self._text_widget(QLabel, 'Bereit')
+        self.recording_value = QLabel("00:00")
+        self.recording_value.setObjectName("timer")
+        actions.addWidget(self.status_value)
+        actions.addSpacing(20)
+        actions.addWidget(self.recording_value)
+        recording.addLayout(actions)
+        work.addWidget(recording_card)
+        self.progress_detail = self._text_widget(QLabel, 'Noch keine Transkription gestartet.')
+        self.progress_detail.setWordWrap(True)
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self.cancel_button = self._text_widget(QPushButton, 'Transkription abbrechen')
+        self.progress_panel = QWidget()
+        progress = QHBoxLayout(self.progress_panel)
+        progress.setContentsMargins(0, 0, 0, 0)
+        progress.addWidget(self.progress_bar, 1)
+        progress.addWidget(self.cancel_button)
+        work.addWidget(self.progress_panel)
+        self.error_label = QLabel()
+        self.error_label.setObjectName("errorBanner")
+        self.error_label.setWordWrap(True)
+        self.error_label.hide()
+        work.addWidget(self.error_label)
+        transcript = QFrame()
+        transcript.setObjectName("panelCard")
+        transcript_layout = QVBoxLayout(transcript)
+        transcript_layout.setContentsMargins(20, 14, 20, 16)
+        toolbar = QHBoxLayout()
+        heading = self._text_widget(QLabel, 'Transkript')
+        heading.setObjectName("sectionTitle")
+        toolbar.addWidget(heading)
+        toolbar.addStretch()
+        self._set_ui_text(self.timestamps_checkbox, 'Zeitstempel')
+        toolbar.addWidget(self.timestamps_checkbox)
+        self.copy_transcript_button = self._text_widget(QPushButton, 'Kopieren')
+        self.export_button = self._text_widget(QPushButton, 'Exportieren')
+        toolbar.addWidget(self.copy_transcript_button)
+        toolbar.addWidget(self.export_button)
+        transcript_layout.addLayout(toolbar)
+        self.transcript_edit = IsolatedWheelPlainTextEdit()
+        self.transcript_edit.translate_ui = self._tr
+        self.transcript_edit.setObjectName("transcriptEditor")
+        self._set_ui_text(self.transcript_edit, 'Hier erscheint dein Transkript nach der Aufnahme.\nDu kannst den Text anschließend bearbeiten, kopieren oder exportieren.', setter='setPlaceholderText')
+        self.transcript_edit.setMinimumHeight(180)
+        transcript_layout.addWidget(self.transcript_edit, 1)
+        work.addWidget(transcript, 1)
+        work.addWidget(self.progress_detail)
         add_setting("Speicherpfad", wrap_inline_layout(storage_row))
-        add_setting("Sprache", self.language_combo)
+        add_setting("Oberflächensprache", self.ui_language_combo)
+        language_hint = self._text_widget(QLabel, "Oberflächensprache wird sofort angezeigt. Zum Beibehalten Einstellungen speichern.")
+        language_hint.setWordWrap(True)
+        language_hint.setObjectName("mutedLabel")
+        settings_form.addWidget(language_hint)
+        add_setting("Erkennungssprache (Audio)", self.language_combo)
         add_setting("Whisper-Modell", self.model_combo)
         add_setting("Performance", self.performance_profile_combo)
-        add_setting("Transkript", self.timestamps_checkbox)
         add_setting("Textformat", self.transcript_format_combo)
         add_setting("Aufnahme-Dateien", self.cleanup_recordings_checkbox)
-        add_setting("Aufnahmequelle", self.recording_source_combo)
-        add_setting("Systemaudio-Gerät", wrap_inline_layout(audio_device_row))
-        add_setting("Mikrofon-Gerät", wrap_inline_layout(microphone_device_row))
-        add_setting("App-Audio", wrap_inline_layout(app_audio_row))
-        settings_form.addWidget(self.app_audio_hint)
         add_setting("Start-Hotkey", self.start_hotkey_edit)
         add_setting("Stopp-Hotkey", self.stop_hotkey_edit)
         add_setting("Push-to-Transcribe", self.push_to_transcribe_hotkey_edit)
         settings_form.addWidget(hotkey_hint)
-
-        self.save_settings_button = QPushButton("Einstellungen speichern")
+        self.save_settings_button = self._text_widget(QPushButton, 'Einstellungen speichern')
         self.save_settings_button.setObjectName("primaryButton")
-
-        notes_group = QGroupBox("Hinweise")
-        notes_group.setObjectName("noteCard")
-        notes_layout = QVBoxLayout(notes_group)
-        notes_layout.setSpacing(10)
-        notes_layout.setContentsMargins(18, 44, 18, 18)
-        note_one = QLabel(
-            "Die Aufnahme nutzt unter Windows WASAPI-Loopback. "
-            "Das erste Transkript lädt das gewählte Modell einmalig lokal herunter."
-        )
-        note_one.setWordWrap(True)
-        note_one.setObjectName("noteLabel")
-        note_two = QLabel(
-            "Importierte Dateien werden direkt transkribiert. "
-            "Aufgenommene Audios können nach erfolgreicher Transkription automatisch entfernt werden."
-        )
-        note_two.setWordWrap(True)
-        note_two.setObjectName("noteLabel")
-        notes_layout.addWidget(note_one)
-        notes_layout.addWidget(note_two)
-
-        log_group = QGroupBox("Log")
-        log_group.setObjectName("panelCard")
-        log_layout = QVBoxLayout(log_group)
-        log_layout.setContentsMargins(18, 44, 18, 18)
-        log_layout.setSpacing(10)
-        self.log_view = QPlainTextEdit()
-        self.log_view.setObjectName("logView")
-        self.log_view.setReadOnly(True)
-        self.log_view.setPlaceholderText("Hier erscheinen Laufzeitmeldungen und Fehler.")
-        self.log_view.document().setMaximumBlockCount(500)
-        self.log_view.setMinimumHeight(130)
-        log_layout.addWidget(self.log_view)
-
-        settings_layout.addWidget(settings_group)
-        settings_layout.addWidget(self.save_settings_button)
-        settings_layout.addWidget(notes_group)
-        settings_layout.addWidget(log_group, 1)
-        settings_layout.addStretch(1)
+        settings_form.addWidget(self.save_settings_button)
+        settings_form.addStretch()
         settings_panel.setWidget(settings_content)
-
-        splitter.addWidget(workspace_scroll)
-        splitter.addWidget(settings_panel)
-        splitter.setStretchFactor(0, 3)
-        splitter.setStretchFactor(1, 2)
-        splitter.setSizes([880, 520])
-
-        layout.addWidget(hero)
-        layout.addWidget(splitter, 1)
+        workspace_scroll = QScrollArea()
+        workspace_scroll.setWidgetResizable(True)
+        workspace_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        workspace_scroll.setWidget(workspace)
+        self.pages.addWidget(workspace_scroll)
+        self.pages.addWidget(settings_panel)
+        self.workspace_button.clicked.connect(lambda: self._show_page(0))
+        self.settings_button.clicked.connect(lambda: self._show_page(1))
+        footer = QHBoxLayout()
+        footer.addWidget(self._text_widget(QLabel, 'Lokal transkribieren'))
+        self.settings_summary = QLabel()
+        self.settings_summary.setObjectName("mutedLabel")
+        footer.addWidget(self.settings_summary)
+        footer.addStretch()
+        self.diagnostics_button = self._text_widget(QPushButton, 'Diagnose')
+        self.diagnostics_button.setCheckable(True)
+        footer.addWidget(self.diagnostics_button)
+        layout.addLayout(footer)
+        self.diagnostics_panel = QWidget()
+        diagnostics = QVBoxLayout(self.diagnostics_panel)
+        self.source_value = QLabel()
+        self.source_value.setWordWrap(True)
+        self.autosave_value = QLabel()
+        self.autosave_value.setWordWrap(True)
+        self.push_to_transcribe_value = self._text_widget(QLabel, 'Bereit')
+        for widget in (self.source_value, self.autosave_value, self.push_to_transcribe_value):
+            diagnostics.addWidget(widget)
+        self.log_view = QPlainTextEdit()
+        self.log_view.setReadOnly(True)
+        self.log_view.document().setMaximumBlockCount(500)
+        self.log_view.setMaximumHeight(100)
+        diagnostics.addWidget(self.log_view)
+        self.diagnostics_panel.hide()
+        self.diagnostics_button.toggled.connect(self.diagnostics_panel.setVisible)
+        layout.addWidget(self.diagnostics_panel)
+        for combo in (self.language_combo, self.model_combo):
+            combo.currentTextChanged.connect(self._update_settings_summary)
         self.setCentralWidget(root)
-
+        self.ui_language_combo.currentIndexChanged.connect(self._apply_ui_language)
         self.duration_timer = QTimer(self)
         self.duration_timer.setInterval(1_000)
+        self._status_finished_until = 0.0
+        self.status_timer = QTimer(self)
+        self.status_timer.setInterval(50)
+        self.status_timer.timeout.connect(self._update_audio_status)
+        self.status_timer.start()
+
+    def _update_audio_status(self) -> None:
+        if self.audio_service.is_recording:
+            self.audio_status.set_status("recording", float(self.audio_service.audio_level))
+        elif self._is_transcribing():
+            self.audio_status.set_status("transcribing")
+        elif time.monotonic() < self._status_finished_until:
+            self.audio_status.set_status("finished")
+        else:
+            self.audio_status.set_status("ready")
+        state = self.push_to_transcribe_state
+        bar_state = ("recording" if state == PushToTranscribeState.RECORDING else
+                     "transcribing" if state != PushToTranscribeState.IDLE else "ready")
+        idle_text = (self._dictation_feedback if time.monotonic() < self._dictation_feedback_until
+                     else "Zum Diktieren halten")
+        self.dictation_bar.indicator.LABELS = {
+            "ready": self._tr(idle_text), "recording": self._tr("Sprich jetzt …"),
+            "transcribing": self._tr("Wird transkribiert …"), "finished": self._tr("Transkript fertig"),
+        }
+        self.dictation_bar.shortcut.setText(
+            keyboard_to_qt_hotkey(self.settings.push_to_transcribe_hotkey)
+        )
+        self.dictation_bar.indicator.set_status(
+            bar_state, float(self.audio_service.audio_level) if bar_state == "recording" else 0.0
+        )
+        self.dictation_bar.indicator.update()
+
+    def _show_page(self, index: int) -> None:
+        self.pages.setCurrentIndex(index)
+        self.workspace_button.setChecked(index == 0)
+        self.settings_button.setChecked(index == 1)
+
+    def _update_settings_summary(self, *_args) -> None:
+        self._set_ui_text(self.settings_summary,
+                          "Sprache: {language}    ·    Modell: {model}",
+                          language=self.language_combo.currentText(), model=self.model_combo.currentText())
+
+    def _select_source(self, source: str) -> None:
+        if source == RECORDING_SOURCE_SYSTEM_AUDIO and self.system_microphone_checkbox.isChecked():
+            source = RECORDING_SOURCE_SYSTEM_AUDIO_AND_MICROPHONE
+        self._set_combo_data(self.recording_source_combo, source)
+
+    def _toggle_system_microphone(self, checked: bool) -> None:
+        self._set_combo_data(self.recording_source_combo,
+                             RECORDING_SOURCE_SYSTEM_AUDIO_AND_MICROPHONE if checked
+                             else RECORDING_SOURCE_SYSTEM_AUDIO)
 
     def _apply_style(self) -> None:
-        self.setStyleSheet(
-            """
-            QMainWindow {
-                background: #e9eef3;
-            }
-            QWidget {
-                color: #17212b;
-                font-family: "Segoe UI", "Noto Sans", sans-serif;
-                font-size: 14px;
-            }
-            QWidget#appRoot {
-                background: qlineargradient(
-                    x1: 0, y1: 0, x2: 1, y2: 1,
-                    stop: 0 #f7fafc,
-                    stop: 0.52 #eef4f7,
-                    stop: 1 #e4edf1
-                );
-            }
-            QFrame#heroCard {
-                background: qlineargradient(
-                    x1: 0, y1: 0, x2: 1, y2: 0,
-                    stop: 0 #102a3a,
-                    stop: 0.55 #0e5d68,
-                    stop: 1 #1f7a6d
-                );
-                border: 1px solid rgba(255, 255, 255, 0.22);
-                border-radius: 26px;
-            }
-            QLabel#heroTitle {
-                color: #f7fbfc;
-                font-size: 26px;
-                font-weight: 800;
-            }
-            QLabel#heroAuthor {
-                color: rgba(247, 251, 252, 0.78);
-                font-size: 12px;
-                font-weight: 700;
-                letter-spacing: 0.5px;
-            }
-            QLabel#heroSubtitle {
-                color: #cfe3e8;
-                font-size: 15px;
-                font-weight: 500;
-            }
-            QLabel#heroBadge {
-                background: rgba(255, 255, 255, 0.14);
-                color: #eaf7f8;
-                border: 1px solid rgba(255, 255, 255, 0.20);
-                border-radius: 12px;
-                padding: 6px 10px;
-                font-size: 12px;
-                font-weight: 700;
-            }
-            QFrame#heroStatusCard {
-                background: rgba(255, 255, 255, 0.13);
-                border: 1px solid rgba(255, 255, 255, 0.22);
-                border-radius: 18px;
-            }
-            QLabel#heroStatusCaption {
-                color: #ffffff;
-                font-size: 16px;
-                font-weight: 800;
-            }
-            QLabel#heroStatusText {
-                color: #d7ecf0;
-                font-size: 13px;
-            }
-            QSplitter#mainSplitter::handle {
-                background: transparent;
-                width: 14px;
-            }
-            QGroupBox#panelCard,
-            QGroupBox#transcriptPanel,
-            QGroupBox#noteCard {
-                background: #ffffff;
-                border: 1px solid #dce6eb;
-                border-radius: 18px;
-                margin-top: 0;
-                padding-top: 0;
-                font-weight: 800;
-                color: #102a3a;
-            }
-            QGroupBox::title {
-                subcontrol-origin: border;
-                subcontrol-position: top left;
-                left: 18px;
-                top: 14px;
-                padding: 0;
-                color: #102a3a;
-                background: transparent;
-                font-size: 14px;
-                font-weight: 800;
-            }
-            QFrame#statusBoard {
-                background: #f7fafb;
-                border: 1px solid #e3edf1;
-                border-radius: 16px;
-            }
-            QLabel#metricCaption {
-                color: #6a7b86;
-                font-size: 11px;
-                font-weight: 800;
-            }
-            QLabel#metricValue {
-                color: #102a3a;
-                font-size: 16px;
-                font-weight: 800;
-            }
-            QLabel#metricValueSmall {
-                color: #253846;
-                font-size: 13px;
-                font-weight: 600;
-            }
-            QLabel#sectionHint,
-            QLabel#mutedLabel {
-                color: #647682;
-                font-weight: 700;
-            }
-            QLabel#fieldLabel {
-                color: #455966;
-                font-size: 12px;
-                font-weight: 800;
-                padding-top: 4px;
-            }
-            QScrollArea#sideScroll {
-                background: transparent;
-                border: none;
-            }
-            QScrollArea#workspaceScroll {
-                background: #eef4f7;
-                border: none;
-            }
-            QWidget#workspaceViewport,
-            QWidget#workspacePanel {
-                background: #eef4f7;
-                border: none;
-            }
-            QWidget#sidePanel,
-            QWidget#inlineField {
-                background: transparent;
-                border: none;
-            }
-            QLabel#noteLabel {
-                color: #455966;
-                background: #f6fafb;
-                border: 1px solid #e2ecef;
-                border-radius: 14px;
-                padding: 10px 12px;
-                font-weight: 600;
-            }
-            QLabel#errorBanner {
-                background: #fff4f1;
-                color: #a83b22;
-                border: 1px solid #f2c4b7;
-                border-radius: 14px;
-                padding: 10px 12px;
-                font-weight: 800;
-            }
-            QPushButton {
-                border: none;
-                border-radius: 11px;
-                padding: 9px 12px;
-                min-height: 28px;
-                font-weight: 700;
-            }
-            QPushButton#primaryButton {
-                background: #0f766e;
-                color: #ffffff;
-            }
-            QPushButton#primaryButton:hover {
-                background: #0b655f;
-            }
-            QPushButton#secondaryButton {
-                background: #e7f3f4;
-                color: #0b5c66;
-                border: 1px solid #cbe2e6;
-            }
-            QPushButton#secondaryButton:hover {
-                background: #d9ecef;
-                border-color: #b4d7dd;
-            }
-            QPushButton#dangerButton {
-                background: #fff0eb;
-                color: #a83b22;
-                border: 1px solid #f2c4b7;
-            }
-            QPushButton#dangerButton:hover {
-                background: #ffe5dd;
-            }
-            QPushButton#ghostButton {
-                background: transparent;
-                color: #0b5c66;
-                border: 1px solid #cfdee4;
-            }
-            QPushButton#ghostButton:hover {
-                background: #eef7f8;
-            }
-            QPushButton:disabled {
-                background: #d9e1e6;
-                color: #94a3ad;
-                border: 1px solid #d0d9df;
-            }
-            QLineEdit,
-            QComboBox,
-            QKeySequenceEdit {
-                background: #f9fcfd;
-                border: 1px solid #cbdbe2;
-                border-radius: 11px;
-                padding: 7px 10px;
-                selection-background-color: #bfe6eb;
-                min-height: 28px;
-            }
-            QLineEdit:focus,
-            QComboBox:focus,
-            QKeySequenceEdit:focus,
-            QPlainTextEdit:focus {
-                border: 1px solid #13a0ad;
-                background: #ffffff;
-            }
-            QComboBox::drop-down {
-                border: none;
-                width: 28px;
-            }
-            QCheckBox {
-                color: #253846;
-                font-weight: 600;
-                spacing: 8px;
-            }
-            QCheckBox::indicator {
-                width: 18px;
-                height: 18px;
-                border-radius: 6px;
-                border: 1px solid #b9cbd3;
-                background: #f9fcfd;
-            }
-            QCheckBox::indicator:checked {
-                background: #0f766e;
-                border: 1px solid #0f766e;
-            }
-            QPlainTextEdit {
-                background: #f9fcfd;
-                border: 1px solid #cbdbe2;
-                border-radius: 16px;
-                padding: 12px 14px;
-                selection-background-color: #bfe6eb;
-                selection-color: #102a3a;
-            }
-            QPlainTextEdit#transcriptEditor {
-                background: #fbfdfd;
-                color: #152631;
-                font-family: "Cascadia Mono", "Consolas", monospace;
-                font-size: 13px;
-                border-radius: 18px;
-            }
-            QPlainTextEdit#logView {
-                background: #10212b;
-                color: #d9eef0;
-                border: 1px solid #183343;
-                font-family: "Cascadia Mono", "Consolas", monospace;
-                font-size: 12px;
-            }
-            QMenu {
-                background: #ffffff;
-                color: #17212b;
-                border: 1px solid #cbdbe2;
-                border-radius: 12px;
-                padding: 6px;
-            }
-            QMenu::item {
-                background: transparent;
-                border-radius: 8px;
-                padding: 7px 28px 7px 12px;
-                margin: 1px 0;
-            }
-            QMenu::item:selected {
-                background: #e7f3f4;
-                color: #0b5c66;
-            }
-            QMenu::item:disabled {
-                color: #9aa9b2;
-            }
-            QMenu::separator {
-                height: 1px;
-                background: #e3edf1;
-                margin: 6px 8px;
-            }
-            QProgressBar {
-                border: 1px solid #cbdbe2;
-                border-radius: 12px;
-                text-align: center;
-                background: #eaf2f5;
-                min-height: 24px;
-                color: #102a3a;
-                font-weight: 800;
-            }
-            QProgressBar::chunk {
-                background: qlineargradient(
-                    x1: 0, y1: 0, x2: 1, y2: 0,
-                    stop: 0 #0f766e,
-                    stop: 1 #17a4b3
-                );
-                border-radius: 11px;
-            }
-            QScrollBar:vertical {
-                background: transparent;
-                width: 12px;
-                margin: 4px;
-            }
-            QScrollBar::handle:vertical {
-                background: #b9cbd3;
-                border-radius: 6px;
-                min-height: 30px;
-            }
-            QScrollBar::handle:vertical:hover {
-                background: #8fa8b4;
-            }
-            QScrollBar::add-line:vertical,
-            QScrollBar::sub-line:vertical {
-                height: 0;
-            }
-            """
-        )
+        assets = (Path(__file__).parent / "assets").as_posix()
+        self.setStyleSheet("""
+            QWidget { background: transparent; color: #e7edf2; font-family: 'Segoe UI'; font-size: 14px; }
+            QMainWindow, QWidget#appRoot, QScrollArea > QWidget > QWidget { background: #111418; }
+            QLabel { background: transparent; }
+            QLabel#brand { font-size: 20px; font-weight: 600; }
+            QLabel#pageTitle { font-size: 28px; font-weight: 600; }
+            QLabel#sectionTitle { font-size: 22px; font-weight: 600; }
+            QLabel#timer { font-size: 22px; color: #b9c6d2; }
+            QLabel#mutedLabel { color: #a7b3c0; }
+            QFrame#panelCard { background: #1a1f25; border: 1px solid #343e47; border-radius: 8px; }
+
+            QPushButton { border: 1px solid #46515c; border-radius: 7px; padding: 9px 16px; background: #1a1f25; }
+            QPushButton:hover { background: #29343c; border-color: #82919e; }
+            QPushButton:pressed { background: #35454c; }
+            QPushButton:disabled { color: #74808b; border-color: #303941; background: #171c21; }
+            QPushButton#primaryButton { background: #62d6be; color: #071b19; border: none; font-weight: 600; padding: 12px 28px; }
+            QPushButton#primaryButton:hover { background: #83e6d1; }
+            QPushButton#dangerButton { background: #a23d49; color: white; border: none; }
+            QPushButton#sourceButton:checked { background: #24403f; border: 1px solid #62d6be; color: #78e0ce; }
+            QPushButton#navigationButton { border: none; border-radius: 0; background: transparent; }
+            QPushButton#navigationButton:checked { color: #78e0ce; border-bottom: 2px solid #62d6be; }
+            QComboBox, QLineEdit, QKeySequenceEdit { background: #171d23; border: 1px solid #46515c; border-radius: 6px; padding: 9px; min-height: 20px; selection-background-color: #285f59; }
+            QComboBox { padding-right: 36px; }
+            QComboBox::drop-down { subcontrol-origin: padding; subcontrol-position: top right; width: 34px; border: none; background: transparent; }
+            QComboBox::down-arrow { image: url("__ASSETS__/chevron-down.svg"); width: 16px; height: 16px; }
+            QComboBox::down-arrow:disabled { image: url("__ASSETS__/chevron-down-disabled.svg"); }
+            QComboBox:hover { border-color: #63727e; }
+            QComboBox:focus { border-color: #62d6be; }
+            QComboBox:disabled { color: #74808b; border-color: #303941; }
+            QComboBox QAbstractItemView { background: #202830; color: #e7edf2; selection-background-color: #285f59; }
+            QCheckBox { spacing: 10px; padding: 4px 0; }
+            QCheckBox::indicator { width: 32px; height: 18px; border-radius: 9px; background: #424e58; border: 1px solid #63727e; }
+            QCheckBox::indicator:checked { background: #62d6be; border: 1px solid #62d6be; }
+            QCheckBox:disabled { color: #74808b; }
+            QPlainTextEdit { background: #1a1f25; border: 1px solid #343e47; border-radius: 6px; padding: 12px; selection-background-color: #285f59; }
+            QPlainTextEdit#transcriptEditor { border: none; font-size: 16px; padding: 14px 0; }
+            QProgressBar { border: 1px solid #343e47; border-radius: 5px; text-align: center; min-height: 16px; }
+            QProgressBar::chunk { background: #347f74; }
+            QLabel#errorBanner { color: #ffb4bb; background: #442830; padding: 10px; border-radius: 6px; }
+            QScrollArea { border: none; }
+            QScrollBar { background: #151a20; border: none; border-radius: 5px; }
+            QScrollBar:vertical { width: 10px; margin: 2px 0; }
+            QScrollBar:horizontal { height: 10px; margin: 0 2px; }
+            QScrollBar::handle { background: #46515c; border-radius: 5px; }
+            QScrollBar::handle:vertical { min-height: 32px; }
+            QScrollBar::handle:horizontal { min-width: 32px; }
+            QScrollBar::handle:hover { background: #63727e; }
+            QScrollBar::handle:pressed { background: #62d6be; }
+            QScrollBar::handle:disabled { background: #303941; }
+            QScrollBar::add-page, QScrollBar::sub-page { background: transparent; border: none; }
+            QScrollBar::add-line, QScrollBar::sub-line { background: transparent; border: none; width: 0; height: 0; }
+            QScrollBar::up-arrow, QScrollBar::down-arrow,
+            QScrollBar::left-arrow, QScrollBar::right-arrow { image: none; width: 0; height: 0; }
+            QAbstractScrollArea::corner { background: #151a20; border: none; }
+            QToolTip { background: #26313a; color: #e7edf2; border: 1px solid #63727e; padding: 5px; }
+        """.replace("__ASSETS__", assets))
 
     def _install_log_handler(self) -> None:
         if self.log_handler is not None:
@@ -1172,9 +1336,9 @@ class MainWindow(QMainWindow):
         self.log_view.appendPlainText(message)
 
     def _show_error(self, message: str) -> None:
-        self.error_label.setText(message)
+        self._set_ui_text(self.error_label, message)
         self.error_label.show()
-        self.progress_detail.setText(message)
+        self._set_ui_text(self.progress_detail, message)
 
     def _clear_error(self) -> None:
         self.error_label.clear()
@@ -1187,13 +1351,15 @@ class MainWindow(QMainWindow):
         *,
         is_error: bool = False,
     ) -> None:
-        self.push_to_transcribe_value.setText(status_text)
+        self._set_ui_text(self.push_to_transcribe_value, status_text)
+        self._dictation_feedback = status_text
+        self._dictation_feedback_until = time.monotonic() + 5.0
         if not detail_text:
             return
         if is_error:
             self._show_error(detail_text)
         else:
-            self.progress_detail.setText(detail_text)
+            self._set_ui_text(self.progress_detail, detail_text)
 
     @staticmethod
     def _normalise_cleanup_path(path: Path) -> Path:
@@ -1213,7 +1379,7 @@ class MainWindow(QMainWindow):
             if cleanup_audio_path is not None
             else None
         )
-        delete_after_success = (
+        delete_after_transcription = (
             normalised_cleanup_path is not None
             and self.settings.delete_recorded_audio_after_transcription
         )
@@ -1221,24 +1387,26 @@ class MainWindow(QMainWindow):
             job_id=uuid4().hex,
             audio_path=normalised_audio_path,
             cleanup_audio_path=normalised_cleanup_path,
-            delete_recorded_audio_after_success=delete_after_success,
+            delete_recorded_audio_after_transcription=delete_after_transcription,
         )
         logger.info(
-            "Transkriptionsjob erstellt: job=%s audio=%s cleanup=%s delete_after_success=%s",
+            "Transkriptionsjob erstellt: job=%s audio=%s cleanup=%s delete_after_transcription=%s",
             job.job_id,
             job.audio_path,
             job.cleanup_audio_path or "<kein Cleanup>",
-            job.delete_recorded_audio_after_success,
+            job.delete_recorded_audio_after_transcription,
         )
         return job
 
-    def _cleanup_recorded_audio_after_success(self, result: TranscriptionResult) -> None:
+    def _cleanup_recorded_audio_after_transcription(self, result: TranscriptionResult | None = None) -> None:
         job = self.active_transcription_job
         if job is None:
             logger.warning("Kein aktiver Transkriptionsjob für Cleanup vorhanden; Audiodatei bleibt erhalten.")
             return
 
-        result_audio_path = self._normalise_cleanup_path(result.audio_path)
+        result_audio_path = (
+            self._normalise_cleanup_path(result.audio_path) if result is not None else job.audio_path
+        )
         if result_audio_path != job.audio_path:
             logger.warning(
                 "Cleanup blockiert: Ergebnis-Audio passt nicht zum aktiven Job. job=%s erwartet=%s erhalten=%s",
@@ -1252,7 +1420,7 @@ class MainWindow(QMainWindow):
         if cleanup_path is None:
             logger.debug("Keine Cleanup-Aktion für importierten Transkriptionsjob %s", job.job_id)
             return
-        if not job.delete_recorded_audio_after_success:
+        if not job.delete_recorded_audio_after_transcription:
             logger.info("Automatisches Löschen ist für Transkriptionsjob %s deaktiviert: %s", job.job_id, cleanup_path)
             return
         if cleanup_path != job.audio_path:
@@ -1273,9 +1441,9 @@ class MainWindow(QMainWindow):
                 return
             cleanup_path.unlink()
         except OSError:
-            logger.exception("Aufgenommene Audiodatei konnte nach erfolgreicher Transkription nicht gelöscht werden: %s", cleanup_path)
+            logger.exception("Aufgenommene Audiodatei konnte nach Ende der Transkription nicht gelöscht werden: %s", cleanup_path)
         else:
-            logger.info("Aufgenommene Audiodatei nach erfolgreicher Transkription gelöscht: %s", cleanup_path)
+            logger.info("Aufgenommene Audiodatei nach Ende der Transkription gelöscht: %s", cleanup_path)
 
     def _connect_signals(self) -> None:
         self.start_button.clicked.connect(self.start_recording)
@@ -1290,6 +1458,7 @@ class MainWindow(QMainWindow):
         self.timestamps_checkbox.toggled.connect(self._apply_timestamp_display)
         self.transcript_format_combo.currentIndexChanged.connect(self._apply_timestamp_display)
         self.refresh_devices_button.clicked.connect(self.reload_audio_devices)
+        self.app_audio_microphone_checkbox.toggled.connect(self._apply_recording_source_to_ui)
         self.refresh_microphones_button.clicked.connect(self.reload_microphone_devices)
         self.refresh_app_audio_button.clicked.connect(
             lambda: self.reload_application_audio_sessions(show_feedback=True, force_refresh=True)
@@ -1310,7 +1479,7 @@ class MainWindow(QMainWindow):
     def show_help(self) -> None:
         dialog = QDialog(self)
         dialog.setObjectName("helpDialog")
-        dialog.setWindowTitle(f"Hilfe - {APP_NAME}")
+        dialog.setWindowTitle(self._tr("Hilfe - {app}", app=APP_NAME))
         dialog.resize(860, 720)
         dialog.setMinimumSize(680, 520)
 
@@ -1324,9 +1493,9 @@ class MainWindow(QMainWindow):
         header_layout.setContentsMargins(22, 18, 22, 18)
         header_layout.setSpacing(6)
 
-        title = QLabel(f"{APP_NAME} Hilfe")
+        title = QLabel(self._tr("{app} Hilfe", app=APP_NAME))
         title.setObjectName("helpTitle")
-        subtitle = QLabel("Bedienung, Aufnahmequellen, Hotkeys, Transkription und Export auf einen Blick.")
+        subtitle = QLabel(self._tr("Bedienung, Aufnahmequellen, Hotkeys, Transkription und Export auf einen Blick."))
         subtitle.setObjectName("helpSubtitle")
         subtitle.setWordWrap(True)
         header_layout.addWidget(title)
@@ -1340,26 +1509,27 @@ class MainWindow(QMainWindow):
 
         help_view = QTextBrowser()
         help_view.setObjectName("helpText")
+        SmoothWheelScroll(help_view)
         help_view.setOpenExternalLinks(False)
-        help_view.document().setDocumentMargin(18)
+        help_view.document().setDocumentMargin(24)
         help_view.document().setDefaultStyleSheet(
             """
             body {
-                color: #253846;
+                color: #e7edf2;
                 font-family: "Segoe UI", "Noto Sans", sans-serif;
                 font-size: 14px;
                 line-height: 1.45;
             }
             h1 {
-                color: #102a3a;
+                color: #e7edf2;
                 font-size: 26px;
-                font-weight: 800;
+                font-weight: 600;
                 margin: 0 0 16px 0;
             }
             h2 {
-                color: #0b5c66;
+                color: #78e0ce;
                 font-size: 18px;
-                font-weight: 800;
+                font-weight: 600;
                 margin: 22px 0 8px 0;
             }
             p {
@@ -1381,86 +1551,78 @@ class MainWindow(QMainWindow):
         buttons.setObjectName("helpButtons")
         close_button = buttons.button(QDialogButtonBox.StandardButton.Close)
         if close_button is not None:
-            close_button.setText("Schließen")
+            close_button.setText(self._tr("Schließen"))
             close_button.setObjectName("helpCloseButton")
         buttons.rejected.connect(dialog.reject)
         layout.addWidget(buttons)
         dialog.setStyleSheet(
             """
             QDialog#helpDialog {
-                background: #eef4f7;
+                background: #111418;
             }
             QFrame#helpHeader {
-                background: qlineargradient(
-                    x1: 0, y1: 0, x2: 1, y2: 0,
-                    stop: 0 #102a3a,
-                    stop: 0.58 #0e5d68,
-                    stop: 1 #1f7a6d
-                );
-                border: 1px solid rgba(255, 255, 255, 0.18);
-                border-radius: 22px;
+                background: #1a1f25;
+                border: 1px solid #343e47;
+                border-radius: 8px;
             }
             QLabel#helpTitle {
-                color: #f7fbfc;
+                color: #e7edf2;
                 font-size: 26px;
-                font-weight: 800;
+                font-weight: 600;
             }
             QLabel#helpSubtitle {
-                color: #cfe3e8;
+                color: #a7b3c0;
                 font-size: 14px;
                 font-weight: 600;
             }
             QFrame#helpCard {
-                background: #ffffff;
-                border: 1px solid #dce6eb;
-                border-radius: 18px;
+                background: #1a1f25;
+                border: 1px solid #343e47;
+                border-radius: 8px;
             }
             QTextBrowser#helpText {
-                background: #ffffff;
-                color: #253846;
+                background: #1a1f25;
+                color: #e7edf2;
                 border: none;
-                border-radius: 18px;
+                border-radius: 8px;
                 padding: 4px;
-                selection-background-color: #bfe6eb;
-                selection-color: #102a3a;
+                selection-background-color: #285f59;
+                selection-color: #e7edf2;
             }
             QDialogButtonBox#helpButtons {
                 background: transparent;
             }
             QPushButton#helpCloseButton {
-                background: #0f766e;
-                color: #ffffff;
+                background: #62d6be;
+                color: #071b19;
                 border: none;
-                border-radius: 11px;
+                border-radius: 7px;
                 padding: 9px 18px;
                 min-height: 28px;
-                font-weight: 700;
+                font-weight: 600;
             }
             QPushButton#helpCloseButton:hover {
-                background: #0b655f;
-            }
-            QScrollBar:vertical {
-                background: transparent;
-                width: 12px;
-                margin: 4px;
-            }
-            QScrollBar::handle:vertical {
-                background: #b9cbd3;
-                border-radius: 6px;
-                min-height: 30px;
-            }
-            QScrollBar::handle:vertical:hover {
-                background: #8fa8b4;
-            }
-            QScrollBar::add-line:vertical,
-            QScrollBar::sub-line:vertical {
-                height: 0;
+                background: #83e6d1;
             }
             """
         )
         dialog.exec()
 
     def _build_help_markdown(self) -> str:
+        if self.ui_language != "de":
+            hotkeys = {
+                "start": keyboard_to_qt_hotkey(self.settings.start_hotkey) or "—",
+                "stop": keyboard_to_qt_hotkey(self.settings.stop_hotkey) or "—",
+                "push": keyboard_to_qt_hotkey(self.settings.push_to_transcribe_hotkey) or "—",
+            }
+            sections = []
+            for heading, paragraph in HELP_SECTIONS:
+                values = hotkeys if "{start}" in paragraph else {}
+                sections.append(f"## {self._tr(heading)}\n\n{self._tr(paragraph, **values)}")
+            sections.append(self._tr(
+                "Schnell reduziert CPU-Last. Ausgewogen und Qualität nutzen mehr Suchbreite und können länger dauern."
+            ))
+            return "\n\n".join(sections)
         languages = ", ".join(LANGUAGE_OPTIONS.keys())
         models = ", ".join(MODEL_OPTIONS)
         performance_profiles = ", ".join(TRANSCRIPTION_PROFILE_OPTIONS.keys())
@@ -1483,14 +1645,14 @@ class MainWindow(QMainWindow):
 - Mikrofon nutzt normale Eingabegeräte und wird getrennt von Loopback-Geräten behandelt.
 - Systemaudio + Mikrofon nimmt beide Quellen parallel auf und transkribiert danach eine gemeinsame gemischte WAV-Datei.
 - App-Audio ist ein eigener Windows-Modus für erkannte Audio-Sessions laufender Apps. Die Option wird nur nutzbar, wenn der native Helper und Windows Process Loopback verfügbar sind.
-- App-Audio + Mikrofon ist in dieser Version bewusst kein eigener Modus.
+- Bei App-Audio kannst du "Mikrofon mit aufnehmen" aktivieren. App und Mikrofon werden in einer gemeinsamen WAV-Datei aufgenommen und zusammen transkribiert.
 - Die passenden Listen können mit "Loopback aktualisieren", "Mikrofone aktualisieren" und "Apps aktualisieren" neu geladen werden.
 
 ## Aufnahme und Transkription
 - "Aufnahme starten" beginnt eine WAV-Aufnahme mit der aktuell gewählten Quelle und dem gewählten Gerät.
 - "Aufnahme stoppen" beendet die Aufnahme und startet danach automatisch die Transkription im Hintergrund.
 - Aufgenommene WAV-Dateien werden im Unterordner "recordings" des Speicherpfads abgelegt.
-- Wenn automatisches Löschen aktiv ist, werden app-eigene WAV-Aufnahmen erst nach erfolgreicher Transkription entfernt. Importierte Dateien werden nie automatisch gelöscht.
+- Wenn automatisches Löschen aktiv ist, werden app-eigene WAV-Aufnahmen nach Ende der Transkription entfernt, auch bei Abbruch oder Fehlern. Importierte Dateien werden nie automatisch gelöscht.
 - Transkripte werden automatisch als TXT im Unterordner "transcripts" gespeichert.
 - Es kann immer nur eine Aufnahme oder Transkription gleichzeitig laufen.
 
@@ -1503,12 +1665,14 @@ class MainWindow(QMainWindow):
 - Stopp-Hotkey aktuell: {stop_hotkey}.
 - Push-to-Transcribe aktuell: {push_hotkey}.
 - Wenn Start- und Stopp-Hotkey identisch sind, arbeitet die App als Toggle.
-- Push-to-Transcribe startet beim Drücken, stoppt beim Loslassen, transkribiert automatisch und kopiert den fertigen Text in die Zwischenablage.
+- Zum Diktieren Push-to-Transcribe halten, ins Mikrofon sprechen und loslassen. Der Text wird im ursprünglichen, weiterhin aktiven Textfeld eingefügt.
+- Die kleine Diktierleiste zeigt Aufnahme und Verarbeitung, auch bei minimiertem Hauptfenster. Push-to-Transcribe verwendet immer das Mikrofon.
+- Bei Fensterwechsel oder Einfügefehler bleibt der Text für Strg+V in der Zwischenablage. Nach automatischem Einfügen wird der vorherige Inhalt nach etwa drei Sekunden wiederhergestellt, sofern du nichts anderes kopiert hast.
 - Globale Hotkeys können von Windows oder anderen Programmen blockiert werden; in diesem Fall zeigt die App einen Hotkey-Fehler an.
 
 ## Fortschritt, Status und Abbruch
 - Der Bereich "Status" zeigt Aufnahme, Transkription, Fertig- und Fehlerzustand.
-- "Push-to-Transcribe" zeigt den Hold-to-Record-Zustand: bereit, Aufnahme, Transkription oder kopiert.
+- "Push-to-Transcribe" zeigt den Zustand: bereit, Aufnahme, Transkription oder Einfügen.
 - Die Fortschrittsleiste zeigt den Transkriptionsfortschritt.
 - "Transkription abbrechen" fordert einen Abbruch an; der aktuelle Whisper-Chunk kann noch beendet werden.
 - Fehler erscheinen im Fehlerbanner und im Log.
@@ -1527,6 +1691,10 @@ class MainWindow(QMainWindow):
 - SRT und VTT werden aus den gespeicherten Segmentzeiten erzeugt, weil Untertiteldateien Zeitinformationen benötigen.
 
 ## Einstellungen
+
+Oberflächensprache und Audio-Erkennungssprache sind unabhängig. Die Oberfläche wechselt sofort; zum Beibehalten bitte die Einstellungen speichern.
+
+Speicherpfad, Sprache, Modell und Hotkeys findest du oben unter "Einstellungen". Laufzeitmeldungen kannst du unten unter "Diagnose" einblenden.
 - Speicherpfad: legt fest, wo "recordings" und "transcripts" angelegt werden.
 - Sprache: {languages}.
 - Whisper-Modell: {models}.
@@ -1548,7 +1716,7 @@ class MainWindow(QMainWindow):
     def reload_audio_devices(self, show_feedback: bool = True) -> None:
         previous_selection = str(self.audio_device_combo.currentData() or self.settings.audio_device_id)
         self.audio_device_combo.clear()
-        self.audio_device_combo.addItem("Standard-Wiedergabegerät", "")
+        self.audio_device_combo.addItem(self._tr('Standard-Wiedergabegerät'), '')
 
         try:
             self.available_audio_devices = self.audio_service.list_loopback_devices()
@@ -1557,7 +1725,7 @@ class MainWindow(QMainWindow):
             self.available_audio_devices = []
             self._show_error(str(exc))
             if show_feedback:
-                QMessageBox.warning(self, "Audiogeräte", str(exc))
+                QMessageBox.warning(self, self._tr('Audiogeräte'), self._tr(str(exc)))
             return
 
         for device in self.available_audio_devices:
@@ -1570,14 +1738,14 @@ class MainWindow(QMainWindow):
         self._clear_error()
         logger.info("Loopback-Geräteliste aktualisiert")
         if show_feedback:
-            self.progress_detail.setText("Loopback-Geräteliste aktualisiert.")
+            self._set_ui_text(self.progress_detail, 'Loopback-Geräteliste aktualisiert.')
 
     def reload_microphone_devices(self, show_feedback: bool = True) -> None:
         previous_selection = str(
             self.microphone_device_combo.currentData() or self.settings.microphone_device_id
         )
         self.microphone_device_combo.clear()
-        self.microphone_device_combo.addItem("Standard-Mikrofon", "")
+        self.microphone_device_combo.addItem(self._tr('Standard-Mikrofon'), '')
 
         try:
             self.available_microphone_devices = self.audio_service.list_microphone_devices()
@@ -1586,7 +1754,7 @@ class MainWindow(QMainWindow):
             self.available_microphone_devices = []
             self._show_error(str(exc))
             if show_feedback:
-                QMessageBox.warning(self, "Mikrofone", str(exc))
+                QMessageBox.warning(self, self._tr('Mikrofone'), self._tr(str(exc)))
             return
 
         for device in self.available_microphone_devices:
@@ -1599,7 +1767,7 @@ class MainWindow(QMainWindow):
         self._clear_error()
         logger.info("Mikrofonliste aktualisiert")
         if show_feedback:
-            self.progress_detail.setText("Mikrofonliste aktualisiert.")
+            self._set_ui_text(self.progress_detail, 'Mikrofonliste aktualisiert.')
 
     def reload_application_audio_sessions(
         self,
@@ -1610,22 +1778,20 @@ class MainWindow(QMainWindow):
             self.app_audio_session_combo.currentData() or self.settings.application_audio_session_id
         )
         self.app_audio_session_combo.clear()
-        self.app_audio_session_combo.addItem("Keine App-Audio-Session ausgewählt", "")
+        self.app_audio_session_combo.addItem(self._tr('Keine App-Audio-Session ausgewählt'), '')
 
         self.app_audio_capability = self.audio_service.application_audio_capability(
             force_refresh=force_refresh
         )
         if not self.app_audio_capability.supported:
             self.available_app_audio_sessions = []
-            self.app_audio_hint.setText(
-                f"App-Audio ist nicht verfügbar: {self.app_audio_capability.reason}"
-            )
+            self._set_ui_text(self.app_audio_hint, 'App-Audio ist nicht verfügbar: {value0}', value0=self.app_audio_capability.reason)
             self._set_recording_source_item_enabled(RECORDING_SOURCE_APPLICATION_AUDIO, False)
             if self._current_recording_source() == RECORDING_SOURCE_APPLICATION_AUDIO:
                 self._set_combo_data(self.recording_source_combo, RECORDING_SOURCE_SYSTEM_AUDIO)
             logger.warning("App-Audio deaktiviert: %s", self.app_audio_capability.reason)
             if show_feedback:
-                self.progress_detail.setText("App-Audio ist auf diesem System nicht verfügbar.")
+                self._set_ui_text(self.progress_detail, 'App-Audio ist auf diesem System nicht verfügbar.')
             return
 
         self._set_recording_source_item_enabled(RECORDING_SOURCE_APPLICATION_AUDIO, True)
@@ -1636,10 +1802,10 @@ class MainWindow(QMainWindow):
         except AudioCaptureError as exc:
             logger.exception("App-Audio-Sessions konnten nicht geladen werden")
             self.available_app_audio_sessions = []
-            self.app_audio_hint.setText(f"App-Audio-Sessions konnten nicht gelesen werden: {exc}")
+            self._set_ui_text(self.app_audio_hint, 'App-Audio-Sessions konnten nicht gelesen werden: {value0}', value0=exc)
             self._show_error(str(exc))
             if show_feedback:
-                QMessageBox.warning(self, "App-Audio", str(exc))
+                QMessageBox.warning(self, self._tr('App-Audio'), self._tr(str(exc)))
             return
 
         for session in self.available_app_audio_sessions:
@@ -1650,16 +1816,12 @@ class MainWindow(QMainWindow):
             self.app_audio_session_combo.setCurrentIndex(0)
 
         if self.available_app_audio_sessions:
-            self.app_audio_hint.setText(
-                "App-Audio nutzt Windows Process Loopback und nimmt nur die gewählte Audio-App auf."
-            )
+            self._set_ui_text(self.app_audio_hint, 'App-Audio nutzt Windows Process Loopback und nimmt nur die gewählte Audio-App auf.')
         else:
-            self.app_audio_hint.setText(
-                "Keine laufende App-Audio-Session erkannt. Starte Audio in der Ziel-App und aktualisiere die Liste."
-            )
+            self._set_ui_text(self.app_audio_hint, 'Keine laufende App-Audio-Session erkannt. Starte Audio in der Ziel-App und aktualisiere die Liste.')
         logger.info("App-Audio-Sessions aktualisiert")
         if show_feedback:
-            self.progress_detail.setText("App-Audio-Sessions aktualisiert.")
+            self._set_ui_text(self.progress_detail, 'App-Audio-Sessions aktualisiert.')
 
     def _apply_recording_source_to_ui(self, *_args) -> None:
         current_source = str(self.recording_source_combo.currentData() or RECORDING_SOURCE_SYSTEM_AUDIO)
@@ -1672,17 +1834,34 @@ class MainWindow(QMainWindow):
             RECORDING_SOURCE_SYSTEM_AUDIO_AND_MICROPHONE,
         }
         uses_app_audio = current_source == RECORDING_SOURCE_APPLICATION_AUDIO
+        uses_microphone = uses_microphone or (uses_app_audio and self.app_audio_microphone_checkbox.isChecked())
         can_change_devices = not self.audio_service.is_recording and not self._is_transcribing()
-        self.audio_device_combo.setEnabled(uses_systemaudio)
+        self.app_audio_microphone_checkbox.setEnabled(uses_app_audio and can_change_devices)
+        self.audio_device_combo.setEnabled(uses_systemaudio and can_change_devices)
         self.refresh_devices_button.setEnabled(uses_systemaudio and can_change_devices)
-        self.microphone_device_combo.setEnabled(uses_microphone)
+        self.microphone_device_combo.setEnabled(uses_microphone and can_change_devices)
         self.refresh_microphones_button.setEnabled(
             uses_microphone and can_change_devices
         )
         app_audio_available = self.app_audio_capability.supported
-        self.app_audio_session_combo.setEnabled(uses_app_audio and app_audio_available)
+        self.app_audio_session_combo.setEnabled(uses_app_audio and app_audio_available and can_change_devices)
         self.refresh_app_audio_button.setEnabled(can_change_devices)
-        self.app_audio_hint.setVisible(uses_app_audio or not app_audio_available)
+        self.app_audio_hint.setVisible(uses_app_audio and not app_audio_available)
+        self.app_fields.setVisible(uses_app_audio)
+        self.system_fields.setVisible(uses_systemaudio)
+        self.output_fields.setVisible(uses_app_audio or uses_systemaudio)
+        self.app_audio_microphone_checkbox.setVisible(uses_app_audio)
+        self.system_microphone_checkbox.setVisible(uses_systemaudio)
+        self.system_microphone_checkbox.blockSignals(True)
+        self.system_microphone_checkbox.setChecked(current_source == RECORDING_SOURCE_SYSTEM_AUDIO_AND_MICROPHONE)
+        self.system_microphone_checkbox.blockSignals(False)
+        self.system_microphone_checkbox.setEnabled(can_change_devices)
+        self.mix_hint.setVisible(uses_microphone and current_source != RECORDING_SOURCE_MICROPHONE)
+        selected_button_source = RECORDING_SOURCE_SYSTEM_AUDIO if uses_systemaudio else current_source
+        for source, button in self.source_buttons.items():
+            button.setChecked(source == selected_button_source)
+            button.setEnabled(can_change_devices and (source != RECORDING_SOURCE_APPLICATION_AUDIO or app_audio_available))
+        self._set_ui_text(self.source_description, 'App-Audio und Mikrofon gemeinsam aufnehmen' if uses_app_audio and uses_microphone else 'Audio aufnehmen und lokal transkribieren')
 
     def _warn_if_saved_device_missing(self) -> None:
         selected_source = self.settings.recording_source or RECORDING_SOURCE_SYSTEM_AUDIO
@@ -1695,6 +1874,7 @@ class MainWindow(QMainWindow):
             RECORDING_SOURCE_SYSTEM_AUDIO_AND_MICROPHONE,
         }
         needs_app_audio = selected_source == RECORDING_SOURCE_APPLICATION_AUDIO
+        needs_microphone = needs_microphone or (needs_app_audio and self.settings.application_audio_include_microphone)
         if (
             needs_systemaudio
             and self.settings.audio_device_id
@@ -1726,6 +1906,7 @@ class MainWindow(QMainWindow):
 
     def _load_settings_into_form(self) -> None:
         self.storage_input.setText(str(self.settings.output_path()))
+        self._set_combo_data(self.ui_language_combo, self.settings.ui_language)
         self._set_combo_data(self.language_combo, self.settings.language)
         self._set_combo_data(self.model_combo, self.settings.model_size)
         self._set_combo_data(
@@ -1740,6 +1921,7 @@ class MainWindow(QMainWindow):
         self.cleanup_recordings_checkbox.setChecked(
             self.settings.delete_recorded_audio_after_transcription
         )
+        self.app_audio_microphone_checkbox.setChecked(self.settings.application_audio_include_microphone)
         saved_source = self.settings.recording_source
         if saved_source == RECORDING_SOURCE_APPLICATION_AUDIO and not self.app_audio_capability.supported:
             saved_source = RECORDING_SOURCE_SYSTEM_AUDIO
@@ -1792,7 +1974,7 @@ class MainWindow(QMainWindow):
             logger.exception("Hotkey-Registrierung fehlgeschlagen")
             self._set_push_feedback("Push: Hotkey-Fehler", str(exc), is_error=True)
             if notify_on_error:
-                QMessageBox.warning(self, "Hotkey-Fehler", str(exc))
+                QMessageBox.warning(self, self._tr('Hotkey-Fehler'), self._tr(str(exc)))
             return False
         self._clear_error()
         if self.push_to_transcribe_state == PushToTranscribeState.IDLE:
@@ -1811,7 +1993,7 @@ class MainWindow(QMainWindow):
         except ValueError as exc:
             logger.warning("Ungueltige Einstellungen: %s", exc)
             self._show_error(str(exc))
-            QMessageBox.warning(self, "Ungültige Einstellungen", str(exc))
+            QMessageBox.warning(self, self._tr('Ungültige Einstellungen'), self._tr(str(exc)))
             return False
 
         previous_settings = self.settings
@@ -1833,13 +2015,13 @@ class MainWindow(QMainWindow):
         self._clear_error()
         logger.info("Einstellungen gespeichert")
         if show_feedback:
-            self.progress_detail.setText("Einstellungen gespeichert und Hotkeys aktualisiert.")
+            self._set_ui_text(self.progress_detail, 'Einstellungen gespeichert und Hotkeys aktualisiert.')
         return True
 
     def _collect_settings_from_form(self) -> AppSettings:
         output_directory = self.storage_input.text().strip()
         if not output_directory:
-            raise ValueError("Bitte einen Speicherpfad auswählen.")
+            raise ValueError(self._tr('Bitte einen Speicherpfad auswählen.'))
 
         start_hotkey = normalize_hotkey(self._sequence_to_text(self.start_hotkey_edit))
         stop_hotkey = normalize_hotkey(self._sequence_to_text(self.stop_hotkey_edit))
@@ -1847,27 +2029,25 @@ class MainWindow(QMainWindow):
             self._sequence_to_text(self.push_to_transcribe_hotkey_edit)
         )
         if not start_hotkey and not stop_hotkey:
-            raise ValueError("Mindestens ein globaler Hotkey muss gesetzt sein.")
+            raise ValueError(self._tr('Mindestens ein globaler Hotkey muss gesetzt sein.'))
         if not push_to_transcribe_hotkey:
-            raise ValueError("Bitte einen Push-to-Transcribe-Hotkey setzen.")
+            raise ValueError(self._tr('Bitte einen Push-to-Transcribe-Hotkey setzen.'))
 
         if not start_hotkey:
             start_hotkey = stop_hotkey
         if not stop_hotkey:
             stop_hotkey = start_hotkey
         if push_to_transcribe_hotkey in {start_hotkey, stop_hotkey}:
-            raise ValueError(
-                "Der Push-to-Transcribe-Hotkey muss sich von Start- und Stopp-Hotkey unterscheiden."
-            )
+            raise ValueError(self._tr('Der Push-to-Transcribe-Hotkey muss sich von Start- und Stopp-Hotkey unterscheiden.'))
 
         selected_recording_source = str(self.recording_source_combo.currentData() or RECORDING_SOURCE_SYSTEM_AUDIO)
         selected_app_audio_session_id = str(self.app_audio_session_combo.currentData() or "")
         selected_app_audio_session_label = self.app_audio_session_combo.currentText() or ""
         if selected_recording_source == RECORDING_SOURCE_APPLICATION_AUDIO:
             if not self.app_audio_capability.supported:
-                raise ValueError(f"App-Audio ist nicht verfügbar: {self.app_audio_capability.reason}")
+                raise ValueError(self._tr('App-Audio ist nicht verfügbar: {value0}', value0=self.app_audio_capability.reason))
             if not selected_app_audio_session_id:
-                raise ValueError("Bitte eine App-Audio-Session auswählen oder die App-Liste aktualisieren.")
+                raise ValueError(self._tr('Bitte eine App-Audio-Session auswählen oder die App-Liste aktualisieren.'))
 
         settings = AppSettings(
             output_directory=output_directory,
@@ -1875,6 +2055,7 @@ class MainWindow(QMainWindow):
             stop_hotkey=stop_hotkey,
             push_to_transcribe_hotkey=push_to_transcribe_hotkey,
             language=str(self.language_combo.currentData()),
+            ui_language=str(self.ui_language_combo.currentData()),
             model_size=str(self.model_combo.currentData()),
             transcription_profile=str(
                 self.performance_profile_combo.currentData() or TRANSCRIPTION_PROFILE_FAST
@@ -1889,6 +2070,7 @@ class MainWindow(QMainWindow):
             microphone_device_id=str(self.microphone_device_combo.currentData() or ""),
             application_audio_session_id=selected_app_audio_session_id,
             application_audio_session_label=selected_app_audio_session_label,
+            application_audio_include_microphone=self.app_audio_microphone_checkbox.isChecked(),
         )
         settings.ensure_directories()
         return settings
@@ -1915,7 +2097,8 @@ class MainWindow(QMainWindow):
         return str(self.recording_source_combo.currentData() or RECORDING_SOURCE_SYSTEM_AUDIO)
 
     def _current_recording_source_label(self) -> str:
-        return self.recording_source_combo.currentText() or "Systemaudio"
+        return next((label for label, code in RECORDING_SOURCE_OPTIONS.items()
+                     if code == self._current_recording_source()), "Systemaudio")
 
     def _current_selected_device_label(self) -> str:
         current_source = self._current_recording_source()
@@ -1927,7 +2110,7 @@ class MainWindow(QMainWindow):
             return f"Systemaudio: {system_label}\nMikrofon: {microphone_label}"
         if current_source == RECORDING_SOURCE_APPLICATION_AUDIO:
             return self.app_audio_session_combo.currentText() or "Keine App-Audio-Session ausgewählt"
-        return self.audio_device_combo.currentText() or "Standard-Wiedergabegerät"
+        return self.audio_device_combo.currentText() or self._tr("Standard-Wiedergabegerät")
 
     def _apply_timestamp_display(self) -> None:
         if not self.current_timed_transcript_text:
@@ -1948,11 +2131,7 @@ class MainWindow(QMainWindow):
         self._refresh_actions()
 
     def choose_output_directory(self) -> None:
-        selected = QFileDialog.getExistingDirectory(
-            self,
-            "Speicherpfad auswählen",
-            self.storage_input.text() or str(self.settings.output_path()),
-        )
+        selected = QFileDialog.getExistingDirectory(self, self._tr('Speicherpfad auswählen'), self.storage_input.text() or str(self.settings.output_path()))
         if selected:
             self.storage_input.setText(selected)
 
@@ -1969,11 +2148,7 @@ class MainWindow(QMainWindow):
         if self._is_transcribing():
             logger.warning("Aufnahme waehrend laufender Transkription blockiert")
             self._show_error("Während einer laufenden Transkription kann keine neue Aufnahme gestartet werden.")
-            QMessageBox.information(
-                self,
-                "Bitte warten",
-                "Während einer laufenden Transkription kann keine neue Aufnahme gestartet werden.",
-            )
+            QMessageBox.information(self, self._tr('Bitte warten'), self._tr('Während einer laufenden Transkription kann keine neue Aufnahme gestartet werden.'))
             return
 
         if persist_settings and not self._persist_form_settings(show_feedback=False):
@@ -1986,7 +2161,7 @@ class MainWindow(QMainWindow):
         except AudioCaptureError as exc:
             logger.exception("Aufnahme konnte nicht gestartet werden")
             self._show_error(str(exc))
-            QMessageBox.critical(self, "Aufnahme fehlgeschlagen", str(exc))
+            QMessageBox.critical(self, self._tr('Aufnahme fehlgeschlagen'), self._tr(str(exc)))
             return
 
         self._clear_error()
@@ -1996,12 +2171,12 @@ class MainWindow(QMainWindow):
         self.current_timed_transcript_text = ""
         self.transcript_edit.clear()
         self.progress_bar.setValue(0)
-        self.progress_detail.setText(f"{selected_source_label} wird aufgenommen ...")
-        self.status_value.setText(f"Aufnahme läuft ({selected_source_label})")
-        self.source_value.setText(f"{selected_source_label}\n{selected_device_label}\n{output_path}")
-        self.autosave_value.setText("Die WAV-Datei wird bereits geschrieben.")
+        self._set_ui_text(self.progress_detail, '{value0} wird aufgenommen ...', value0=UiText(selected_source_label))
+        self._set_ui_text(self.status_value, 'Aufnahme läuft ({value0})', value0=UiText(selected_source_label))
+        self._set_ui_text(self.source_value, '{value0}\n{value1}\n{value2}', value0=UiText(selected_source_label), value1=selected_device_label, value2=output_path)
+        self._set_ui_text(self.autosave_value, 'Die WAV-Datei wird bereits geschrieben.')
         self.recording_started_at = datetime.now()
-        self.recording_value.setText("00:00")
+        self._set_ui_text(self.recording_value, '00:00')
         self.duration_timer.start()
         self._refresh_actions()
 
@@ -2021,7 +2196,7 @@ class MainWindow(QMainWindow):
         except AudioCaptureError as exc:
             logger.exception("Aufnahme konnte nicht gestoppt werden")
             self._show_error(str(exc))
-            QMessageBox.warning(self, "Aufnahme stoppen", str(exc))
+            QMessageBox.warning(self, self._tr('Aufnahme stoppen'), self._tr(str(exc)))
             return
 
         self._clear_error()
@@ -2033,13 +2208,11 @@ class MainWindow(QMainWindow):
         self.duration_timer.stop()
         self.recording_started_at = None
         self.current_audio_path = result.file_path
-        self.status_value.setText("Aufnahme gespeichert")
-        self.source_value.setText(f"{result.capture_device}\n{result.file_path}")
-        self.recording_value.setText(self._format_duration(result.duration_seconds))
-        self.progress_detail.setText(
-            f"Aufnahme abgeschlossen ({result.capture_device}). Automatische Transkription startet ..."
-        )
-        self.autosave_value.setText(str(result.file_path))
+        self._set_ui_text(self.status_value, 'Aufnahme gespeichert')
+        self._set_ui_text(self.source_value, '{value0}\n{value1}', value0=result.capture_device, value1=result.file_path)
+        self._set_ui_text(self.recording_value, self._format_duration(result.duration_seconds))
+        self._set_ui_text(self.progress_detail, 'Aufnahme abgeschlossen ({value0}). Automatische Transkription startet ...', value0=result.capture_device)
+        self._set_ui_text(self.autosave_value, str(result.file_path))
         self._refresh_actions()
         self._start_transcription(result.file_path, cleanup_audio_path=result.file_path)
 
@@ -2082,6 +2255,9 @@ class MainWindow(QMainWindow):
                 self.push_to_transcribe_state.value,
             )
         self.push_to_transcribe_state = PushToTranscribeState.IDLE
+        self.dictation_insert_timer.stop()
+        self._pending_dictation_text = None
+        self._dictation_target = None
         self.hotkey_manager.reset_push_state()
         self._set_push_feedback(status_text)
 
@@ -2113,17 +2289,13 @@ class MainWindow(QMainWindow):
             )
             return False
 
-        source_label = next(
-            (
-                label
-                for label, source_value in RECORDING_SOURCE_OPTIONS.items()
-                if source_value == self.settings.recording_source
-            ),
-            "Systemaudio",
-        )
+        source_label = "Mikrofon"
+        dictation_settings = replace(self.settings, recording_source=RECORDING_SOURCE_MICROPHONE)
+        self._dictation_target = self.dictation_input.capture_target()
         try:
-            output_path = self.audio_service.start_recording(self.settings)
+            output_path = self.audio_service.start_recording(dictation_settings)
         except AudioCaptureError as exc:
+            self._dictation_target = None
             logger.exception("Push-to-Transcribe Aufnahme konnte nicht gestartet werden")
             self._set_push_feedback("Fehler: Push-Aufnahme nicht gestartet", str(exc), is_error=True)
             return False
@@ -2135,17 +2307,18 @@ class MainWindow(QMainWindow):
         self.current_timed_transcript_text = ""
         self.transcript_edit.clear()
         self.progress_bar.setValue(0)
-        self.progress_detail.setText(f"Push-to-Transcribe nimmt {source_label} auf ...")
-        self.status_value.setText(f"Push-Aufnahme läuft ({source_label})")
-        self.source_value.setText(f"Push-to-Transcribe: {source_label}\n{output_path}")
-        self.autosave_value.setText("Die WAV-Datei wird bereits geschrieben.")
+        self._set_ui_text(self.progress_detail, 'Push-to-Transcribe nimmt {value0} auf ...', value0=UiText(source_label))
+        self._set_ui_text(self.status_value, 'Push-Aufnahme läuft ({value0})', value0=UiText(source_label))
+        self._set_ui_text(self.source_value, 'Push-to-Transcribe: {value0}\n{value1}', value0=UiText(source_label), value1=output_path)
+        self._set_ui_text(self.autosave_value, 'Die WAV-Datei wird bereits geschrieben.')
         self.recording_started_at = datetime.now()
-        self.recording_value.setText("00:00")
+        self._set_ui_text(self.recording_value, '00:00')
         self.duration_timer.start()
         self._transition_push_to_transcribe(
             PushToTranscribeState.RECORDING,
             "Push: Aufnahme läuft",
         )
+        self.dictation_bar.show_near_cursor_screen()
         self._refresh_actions()
         return True
 
@@ -2193,11 +2366,11 @@ class MainWindow(QMainWindow):
         self.duration_timer.stop()
         self.recording_started_at = None
         self.current_audio_path = result.file_path
-        self.status_value.setText("Push-Aufnahme gespeichert")
-        self.source_value.setText(f"{result.capture_device}\n{result.file_path}")
-        self.recording_value.setText(self._format_duration(result.duration_seconds))
-        self.progress_detail.setText("Push-Aufnahme gestoppt. Transkription startet ...")
-        self.autosave_value.setText(str(result.file_path))
+        self._set_ui_text(self.status_value, 'Push-Aufnahme gespeichert')
+        self._set_ui_text(self.source_value, '{value0}\n{value1}', value0=result.capture_device, value1=result.file_path)
+        self._set_ui_text(self.recording_value, self._format_duration(result.duration_seconds))
+        self._set_ui_text(self.progress_detail, 'Push-Aufnahme gestoppt. Transkription startet ...')
+        self._set_ui_text(self.autosave_value, str(result.file_path))
         if not self._transition_push_to_transcribe(
             PushToTranscribeState.TRANSCRIBING,
             "Push: Transkription startet",
@@ -2215,32 +2388,19 @@ class MainWindow(QMainWindow):
         if self.audio_service.is_recording:
             logger.warning("Import waehrend laufender Aufnahme blockiert")
             self._show_error("Bitte die laufende Aufnahme zuerst stoppen.")
-            QMessageBox.information(
-                self,
-                "Aufnahme aktiv",
-                "Bitte die laufende Aufnahme zuerst stoppen.",
-            )
+            QMessageBox.information(self, self._tr('Aufnahme aktiv'), self._tr('Bitte die laufende Aufnahme zuerst stoppen.'))
             return
 
         if self._is_transcribing():
             logger.warning("Import waehrend laufender Transkription blockiert")
             self._show_error("Es läuft bereits eine Transkription.")
-            QMessageBox.information(
-                self,
-                "Bitte warten",
-                "Es läuft bereits eine Transkription.",
-            )
+            QMessageBox.information(self, self._tr('Bitte warten'), self._tr('Es läuft bereits eine Transkription.'))
             return
 
         if not self._persist_form_settings(show_feedback=False):
             return
 
-        file_path, _ = QFileDialog.getOpenFileName(
-            self,
-            "Audiodatei auswählen",
-            str(self.settings.output_path()),
-            "Audio-Dateien (*.wav *.mp3 *.m4a *.flac *.ogg *.aac);;Alle Dateien (*.*)",
-        )
+        file_path, _ = QFileDialog.getOpenFileName(self, self._tr('Audiodatei auswählen'), str(self.settings.output_path()), self._tr('Audiodateien (*.wav *.mp3 *.m4a *.flac *.ogg *.aac);;Alle Dateien (*.*)'))
         if not file_path:
             return
 
@@ -2248,10 +2408,10 @@ class MainWindow(QMainWindow):
         logger.info("Importiere Audiodatei %s", file_path)
         self.current_audio_path = Path(file_path)
         self.current_timed_transcript_text = ""
-        self.source_value.setText(file_path)
-        self.status_value.setText("Datei importiert")
-        self.progress_detail.setText("Importierte Datei wird transkribiert ...")
-        self.recording_value.setText("Dateiimport")
+        self._set_ui_text(self.source_value, file_path)
+        self._set_ui_text(self.status_value, 'Datei importiert')
+        self._set_ui_text(self.progress_detail, 'Importierte Datei wird transkribiert ...')
+        self._set_ui_text(self.recording_value, 'Dateiimport')
         self._refresh_actions()
         self._start_transcription(Path(file_path))
 
@@ -2262,9 +2422,9 @@ class MainWindow(QMainWindow):
         logger.info("Abbruch für laufende Transkription angefordert")
         self.transcription_cancel_requested = True
         self.cancel_button.setEnabled(False)
-        self.status_value.setText("Abbruch angefordert")
+        self._set_ui_text(self.status_value, 'Abbruch angefordert')
         self.progress_bar.setValue(0)
-        self.progress_detail.setText("Abbruch angefordert. Aktueller Whisper-Chunk wird beendet ...")
+        self._set_ui_text(self.progress_detail, 'Abbruch angefordert. Aktueller Whisper-Chunk wird beendet ...')
         self.transcription_worker.cancel()
 
     def _start_transcription(
@@ -2323,8 +2483,8 @@ class MainWindow(QMainWindow):
                 "Push-to-Transcribe wird im Hintergrund transkribiert ...",
             )
         else:
-            self.progress_detail.setText("Transkription wird im Hintergrund vorbereitet ...")
-        self.status_value.setText("Transkription läuft")
+            self._set_ui_text(self.progress_detail, 'Transkription wird im Hintergrund vorbereitet ...')
+        self._set_ui_text(self.status_value, 'Transkription läuft')
         self.transcription_thread.start()
         self._refresh_actions()
 
@@ -2332,9 +2492,10 @@ class MainWindow(QMainWindow):
         if self.transcription_cancel_requested and "Abbruch" not in message:
             return
         self.progress_bar.setValue(value)
-        self.progress_detail.setText(message)
+        self._set_ui_text(self.progress_detail, message)
 
     def _on_transcription_finished(self, result: TranscriptionResult) -> None:
+        self._status_finished_until = time.monotonic() + 3.0
         logger.info("Transkription fertig: %s", result.transcript_path)
         should_copy_to_clipboard = self.transcription_auto_clipboard_requested
         self._clear_error()
@@ -2354,62 +2515,89 @@ class MainWindow(QMainWindow):
                     ),
                 )
             )
-        self.status_value.setText(f"Fertig ({result.detected_language})")
-        self.autosave_value.setText(str(result.transcript_path))
+        self._set_ui_text(self.status_value, 'Fertig ({value0})', value0=result.detected_language)
+        self._set_ui_text(self.autosave_value, str(result.transcript_path))
         self.progress_bar.setValue(100)
-        self.progress_detail.setText(
-            f"Transkription abgeschlossen. Automatisch gespeichert unter {result.transcript_path.name}."
-        )
+        self._set_ui_text(self.progress_detail, 'Transkription abgeschlossen. Automatisch gespeichert unter {value0}.', value0=result.transcript_path.name)
         if should_copy_to_clipboard:
             clipboard_text = format_transcript_text(
                 result.timed_transcript_text,
                 include_timestamps=False,
                 transcript_format=getattr(self.settings, "transcript_format", TRANSCRIPT_FORMAT_COMPACT),
             )
-            if self._copy_text_to_clipboard(
-                clipboard_text,
-                success_message="Push-to-Transcribe fertig: Text ist in der Zwischenablage.",
-                log_label="Push-to-Transcribe Transkript",
-            ):
-                self._reset_push_to_transcribe_state("Push: kopiert")
+            if clipboard_text.strip():
+                self._pending_dictation_text = clipboard_text
+                self._dictation_insert_deadline = time.monotonic() + 3.0
+                self._transition_push_to_transcribe(PushToTranscribeState.INSERTING, "Push: Text einfügen")
+                self.dictation_insert_timer.start()
+                self._try_insert_dictation()
             else:
-                self._reset_push_to_transcribe_state("Fehler: Clipboard")
-        self._cleanup_recorded_audio_after_success(result)
+                self._reset_push_to_transcribe_state("Keine Sprache erkannt")
+        self._cleanup_recorded_audio_after_transcription(result)
         self._refresh_actions()
+
+    def _try_insert_dictation(self) -> None:
+        text = self._pending_dictation_text
+        if text is None:
+            return
+        target_is_current = self.dictation_input.target_is_current(self._dictation_target)
+        modifiers_down = self.dictation_input.modifiers_are_down()
+        if target_is_current and modifiers_down and time.monotonic() < self._dictation_insert_deadline:
+            return
+        self.dictation_insert_timer.stop()
+        self._restore_dictation_clipboard()
+        previous = snapshot_native_windows_clipboard(self._native_clipboard_hwnd())
+        if not self._copy_text_to_clipboard(
+            text, success_message="Push-to-Transcribe fertig: Text ist in der Zwischenablage.",
+            log_label="Push-to-Transcribe Transkript",
+        ):
+            self._reset_push_to_transcribe_state("Fehler: Clipboard")
+            self._refresh_actions()
+            return
+        if target_is_current and not modifiers_down and self.dictation_input.paste(self._dictation_target):
+            self._clipboard_restore_data = previous
+            self._clipboard_restore_sequence = self.dictation_input.clipboard_sequence()
+            # Allow slow editors to consume the paste before restoring copied data.
+            self.clipboard_restore_timer.start(3000)
+            self._reset_push_to_transcribe_state("Push: Text eingefügt")
+        else:
+            self._reset_push_to_transcribe_state("Push: bitte Strg+V")
+            self._set_ui_text(self.progress_detail, 'Automatisches Einfügen nicht möglich. Der Text ist mit Strg+V verfügbar.')
+        self._refresh_actions()
+
+    def _restore_dictation_clipboard(self) -> None:
+        self.clipboard_restore_timer.stop()
+        previous = self._clipboard_restore_data
+        self._clipboard_restore_data = None
+        if previous is not None and self.dictation_input.clipboard_sequence() == self._clipboard_restore_sequence:
+            restore_native_windows_clipboard(previous, self._native_clipboard_hwnd())
 
     def _on_transcription_cancelled(self, message: str) -> None:
         logger.info("Transkription wurde abgebrochen: %s", message)
         was_push_to_transcribe = self.transcription_auto_clipboard_requested
-        if self.active_transcription_job and self.active_transcription_job.cleanup_audio_path:
-            logger.info(
-                "Aufgenommene Audiodatei bleibt nach Abbruch erhalten: %s",
-                self.active_transcription_job.cleanup_audio_path,
-            )
+        self._cleanup_recorded_audio_after_transcription()
         self.transcription_cancel_requested = False
         self.transcription_auto_clipboard_requested = False
         self._clear_error()
-        self.status_value.setText("Abgebrochen")
+        self._set_ui_text(self.status_value, 'Abgebrochen')
         if was_push_to_transcribe:
             self._reset_push_to_transcribe_state("Push: abgebrochen")
-        self.progress_detail.setText(message)
+        self._set_ui_text(self.progress_detail, message)
         self._refresh_actions()
 
     def _on_transcription_failed(self, message: str) -> None:
         logger.error("Transkription fehlgeschlagen: %s", message)
         was_push_to_transcribe = self.transcription_auto_clipboard_requested
-        if self.active_transcription_job and self.active_transcription_job.cleanup_audio_path:
-            logger.info(
-                "Aufgenommene Audiodatei bleibt nach Transkriptionsfehler erhalten: %s",
-                self.active_transcription_job.cleanup_audio_path,
-            )
+        self._cleanup_recorded_audio_after_transcription()
         self.transcription_cancel_requested = False
         self.transcription_auto_clipboard_requested = False
-        self.status_value.setText("Fehler")
+        self._set_ui_text(self.status_value, 'Fehler')
         if was_push_to_transcribe:
             self._reset_push_to_transcribe_state("Push: Fehler")
         self.progress_bar.setValue(0)
         self._show_error(message)
-        QMessageBox.critical(self, "Transkription fehlgeschlagen", message)
+        if not was_push_to_transcribe:
+            QMessageBox.critical(self, self._tr('Transkription fehlgeschlagen'), self._tr(message))
         self._refresh_actions()
 
     def _clear_transcription_refs(self) -> None:
@@ -2490,8 +2678,8 @@ class MainWindow(QMainWindow):
             )
 
         self._clear_error()
-        self.status_value.setText("Transkript kopiert")
-        self.progress_detail.setText(f"{success_message} ({len(text)} Zeichen)")
+        self._set_ui_text(self.status_value, 'Transkript kopiert')
+        self._set_ui_text(self.progress_detail, '{value0} ({value1} Zeichen)', value0=UiText(success_message), value1=len(text))
         return True
 
     def copy_transcript_selection_to_clipboard(self, selected_text: str) -> None:
@@ -2514,23 +2702,14 @@ class MainWindow(QMainWindow):
         if not transcript_text:
             logger.warning("Export ohne vorhandenes Transkript blockiert")
             self._show_error("Es gibt aktuell keinen Text zum Exportieren.")
-            QMessageBox.information(
-                self,
-                "Kein Transkript",
-                "Es gibt aktuell keinen Text zum Exportieren.",
-            )
+            QMessageBox.information(self, self._tr('Kein Transkript'), self._tr('Es gibt aktuell keinen Text zum Exportieren.'))
             return
 
         base_name = "transcript.txt"
         if self.current_audio_path is not None:
             base_name = f"{self.current_audio_path.stem}.txt"
 
-        save_path, selected_filter = QFileDialog.getSaveFileName(
-            self,
-            "Transkript exportieren",
-            str(self.settings.output_path() / base_name),
-            EXPORT_FILTER,
-        )
+        save_path, selected_filter = QFileDialog.getSaveFileName(self, self._tr('Transkript exportieren'), str(self.settings.output_path() / base_name), self._tr(EXPORT_FILTER))
         if not save_path:
             return
 
@@ -2559,7 +2738,7 @@ class MainWindow(QMainWindow):
         except ValueError as exc:
             logger.warning("Exportformat konnte nicht erzeugt werden: %s", exc)
             self._show_error(str(exc))
-            QMessageBox.warning(self, "Export fehlgeschlagen", str(exc))
+            QMessageBox.warning(self, self._tr('Export fehlgeschlagen'), self._tr(str(exc)))
             return
         except OSError:
             message = (
@@ -2568,22 +2747,22 @@ class MainWindow(QMainWindow):
             )
             logger.exception("Export nach %s fehlgeschlagen", target_path)
             self._show_error(message)
-            QMessageBox.critical(self, "Export fehlgeschlagen", message)
+            QMessageBox.critical(self, self._tr('Export fehlgeschlagen'), self._tr(message))
             return
 
         logger.info("Transkript exportiert nach %s", target_path)
         self._clear_error()
         self.current_transcript_path = target_path
-        self.autosave_value.setText(str(target_path))
-        self.progress_detail.setText(f"Transkript exportiert als {target_path.suffix}.")
+        self._set_ui_text(self.autosave_value, str(target_path))
+        self._set_ui_text(self.progress_detail, 'Transkript exportiert als {value0}.', value0=target_path.suffix)
         self._refresh_actions()
 
     def _update_recording_duration(self) -> None:
         if self.recording_started_at is None:
-            self.recording_value.setText("00:00")
+            self._set_ui_text(self.recording_value, '00:00')
             return
         elapsed = (datetime.now() - self.recording_started_at).total_seconds()
-        self.recording_value.setText(self._format_duration(elapsed))
+        self._set_ui_text(self.recording_value, self._format_duration(elapsed))
 
     @staticmethod
     def _format_duration(seconds: float) -> str:
@@ -2648,13 +2827,21 @@ class MainWindow(QMainWindow):
             self._refresh_actions()
 
     def _is_transcribing(self) -> bool:
-        return self.transcription_thread is not None and self.transcription_thread.isRunning()
+        return self._pending_dictation_text is not None or (
+            self.transcription_thread is not None and self.transcription_thread.isRunning()
+        )
 
     def _refresh_actions(self) -> None:
         has_transcript = bool(self.transcript_edit.toPlainText().strip())
         is_recording = self.audio_service.is_recording
         is_transcribing = self._is_transcribing()
 
+        self._update_audio_status()
+        self.start_button.setVisible(not is_recording)
+        self.stop_button.setVisible(is_recording)
+        self.progress_panel.setVisible(is_transcribing)
+        self._update_settings_summary()
+        self._set_ui_text(self.start_button, 'Aufnahme starten ({value0})', value0=self.settings.start_hotkey, setter='setToolTip')
         self.start_button.setEnabled(not is_recording and not is_transcribing)
         self.stop_button.setEnabled(is_recording)
         self.import_button.setEnabled(not is_recording and not is_transcribing)
@@ -2672,11 +2859,7 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event: QCloseEvent) -> None:
         if self.audio_service.is_recording:
-            QMessageBox.information(
-                self,
-                "Aufnahme aktiv",
-                "Bitte die laufende Aufnahme zuerst stoppen.",
-            )
+            QMessageBox.information(self, self._tr('Aufnahme aktiv'), self._tr('Bitte die laufende Aufnahme zuerst stoppen.'))
             event.ignore()
             return
 
@@ -2687,15 +2870,13 @@ class MainWindow(QMainWindow):
                     self.active_transcription_job.job_id,
                     self.active_transcription_job.audio_path,
                 )
-            QMessageBox.information(
-                self,
-                "Transkription aktiv",
-                "Bitte warte, bis die laufende Transkription abgeschlossen ist.",
-            )
+            QMessageBox.information(self, self._tr('Transkription aktiv'), self._tr('Bitte warte, bis die laufende Transkription abgeschlossen ist.'))
             event.ignore()
             return
 
         logger.info("Anwendung wird geschlossen")
+        self._restore_dictation_clipboard()
+        self.dictation_bar.close()
         self.hotkey_manager.shutdown()
         self._remove_log_handler()
         super().closeEvent(event)

@@ -260,6 +260,7 @@ namespace LoopScribe.AppAudioCapture
         private const int ProcessLoopbackModeIncludeTargetProcessTree = 0;
         private const uint AudclntStreamflagsLoopback = 0x00020000;
         private const uint AudclntStreamflagsEventCallback = 0x00040000;
+        private const uint AudclntStreamflagsNopersist = 0x00080000;
         private const uint AudclntStreamflagsAutoconvertPcm = 0x80000000;
         private const uint AudclntStreamflagsSrcDefaultQuality = 0x08000000;
         private const int AudclntSharemodeShared = 0;
@@ -275,6 +276,7 @@ namespace LoopScribe.AppAudioCapture
         private IntPtr captureEvent = IntPtr.Zero;
         private Thread captureThread;
         private volatile bool stopRequested;
+        private bool stopped = true;
         private Exception captureError;
         private WaveFileWriter writer;
         private WaveFormatEx format;
@@ -302,6 +304,7 @@ namespace LoopScribe.AppAudioCapture
             HResult.Check(hr, "IAudioClient.Start");
 
             stopRequested = false;
+            stopped = false;
             captureThread = new Thread(CaptureLoop);
             captureThread.IsBackground = true;
             captureThread.Name = "LoopScribeAppAudioCapture";
@@ -310,6 +313,20 @@ namespace LoopScribe.AppAudioCapture
 
         public void Stop()
         {
+            StopCore(true);
+        }
+
+        private void StopCore(bool throwOnCaptureError)
+        {
+            if (stopped)
+            {
+                if (throwOnCaptureError && captureError != null)
+                {
+                    throw new InvalidOperationException("capture_loop_failed: " + captureError.Message, captureError);
+                }
+                return;
+            }
+
             stopRequested = true;
             if (captureEvent != IntPtr.Zero)
             {
@@ -317,20 +334,27 @@ namespace LoopScribe.AppAudioCapture
             }
             if (captureThread != null)
             {
-                captureThread.Join(5000);
-            }
-            if (captureError != null)
-            {
-                throw new InvalidOperationException("capture_loop_failed: " + captureError.Message, captureError);
+                if (!captureThread.Join(5000))
+                {
+                    if (throwOnCaptureError)
+                    {
+                        throw new TimeoutException("Capture thread did not stop within 5000 ms.");
+                    }
+                }
             }
             if (audioClient != null)
             {
                 audioClient.Stop();
             }
+            stopped = true;
             if (writer != null)
             {
                 writer.Dispose();
                 writer = null;
+            }
+            if (throwOnCaptureError && captureError != null)
+            {
+                throw new InvalidOperationException("capture_loop_failed: " + captureError.Message, captureError);
             }
         }
 
@@ -362,44 +386,48 @@ namespace LoopScribe.AppAudioCapture
             int[] sampleRates = desiredSampleRate == 44100
                 ? new int[] { 44100, 48000 }
                 : new int[] { desiredSampleRate, 44100 };
+            uint baseFlags = AudclntStreamflagsLoopback
+                | AudclntStreamflagsEventCallback
+                | AudclntStreamflagsAutoconvertPcm
+                | AudclntStreamflagsSrcDefaultQuality;
+            uint[] flagOptions = new uint[] { baseFlags | AudclntStreamflagsNopersist, baseFlags };
             int lastHr = 0;
             for (int index = 0; index < sampleRates.Length; index++)
             {
-                WaveFormatEx candidate = WaveFormatEx.Pcm(sampleRates[index], 2, 16);
-                IntPtr formatPtr = Marshal.AllocHGlobal(Marshal.SizeOf(typeof(WaveFormatEx)));
-                try
+                for (int flagIndex = 0; flagIndex < flagOptions.Length; flagIndex++)
                 {
-                    Marshal.StructureToPtr(candidate, formatPtr, false);
-                    captureEvent = NativeMethods.CreateEvent(IntPtr.Zero, false, false, null);
-                    if (captureEvent == IntPtr.Zero)
+                    WaveFormatEx candidate = WaveFormatEx.Pcm(sampleRates[index], 2, 16);
+                    IntPtr formatPtr = Marshal.AllocHGlobal(Marshal.SizeOf(typeof(WaveFormatEx)));
+                    try
                     {
-                        throw new InvalidOperationException("CreateEvent failed.");
+                        Marshal.StructureToPtr(candidate, formatPtr, false);
+                        captureEvent = NativeMethods.CreateEvent(IntPtr.Zero, false, false, null);
+                        if (captureEvent == IntPtr.Zero)
+                        {
+                            throw new InvalidOperationException("CreateEvent failed.");
+                        }
+                        Guid sessionGuid = Guid.NewGuid();
+                        int hr = client.Initialize(
+                            AudclntSharemodeShared,
+                            flagOptions[flagIndex],
+                            10000000,
+                            0,
+                            formatPtr,
+                            ref sessionGuid);
+                        if (hr == 0)
+                        {
+                            hr = client.SetEventHandle(captureEvent);
+                            HResult.Check(hr, "IAudioClient.SetEventHandle");
+                            return candidate;
+                        }
+                        lastHr = hr;
+                        NativeMethods.CloseHandle(captureEvent);
+                        captureEvent = IntPtr.Zero;
                     }
-                    Guid sessionGuid = Guid.Empty;
-                    uint flags = AudclntStreamflagsLoopback
-                        | AudclntStreamflagsEventCallback
-                        | AudclntStreamflagsAutoconvertPcm
-                        | AudclntStreamflagsSrcDefaultQuality;
-                    int hr = client.Initialize(
-                        AudclntSharemodeShared,
-                        flags,
-                        10000000,
-                        0,
-                        formatPtr,
-                        ref sessionGuid);
-                    if (hr == 0)
+                    finally
                     {
-                        hr = client.SetEventHandle(captureEvent);
-                        HResult.Check(hr, "IAudioClient.SetEventHandle");
-                        return candidate;
+                        Marshal.FreeHGlobal(formatPtr);
                     }
-                    lastHr = hr;
-                    NativeMethods.CloseHandle(captureEvent);
-                    captureEvent = IntPtr.Zero;
-                }
-                finally
-                {
-                    Marshal.FreeHGlobal(formatPtr);
                 }
             }
             HResult.Check(lastHr, "IAudioClient.Initialize");
@@ -473,6 +501,13 @@ namespace LoopScribe.AppAudioCapture
         {
             try
             {
+                try
+                {
+                    StopCore(false);
+                }
+                catch
+                {
+                }
                 if (writer != null)
                 {
                     writer.Dispose();

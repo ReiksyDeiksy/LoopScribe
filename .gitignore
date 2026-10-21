@@ -10,3 +10,19 @@ src/**/*.egg-info/
 src/recorder_app/native/CSC*.TMP
 smoke_output/app_audio_capture_smoke.wav
 tmp/app_audio_service_smoke/
+
+# Local tooling, generated output, and personal recordings/transcripts.
+/.agents/
+/.codex/
+/output/
+/tmp/
+/smoke_output/
+/recordings/
+/transcripts/
+*.log
+
+# Local credentials and environment overrides.
+.env
+.env.*
+!.env.example
+!.env.sample

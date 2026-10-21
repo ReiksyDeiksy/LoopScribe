@@ -105,7 +105,8 @@ class GlobalHotkeyManager(QObject):
         self._handles: list[int] = []
         self._push_hook = None
         self._push_tokens: frozenset[str] = frozenset()
-        self._pressed_keys: set[str] = set()
+        self._push_scan_codes: tuple[frozenset[int], ...] = ()
+        self._pressed_scan_codes: set[int] = set()
         self._push_is_down = False
         self._lock = threading.Lock()
 
@@ -131,12 +132,15 @@ class GlobalHotkeyManager(QObject):
                     self._handles.append(keyboard.add_hotkey(stop_hotkey, self.stop_requested.emit))
 
             if push_hotkey:
-                keyboard.parse_hotkey(push_hotkey)
+                steps = keyboard.parse_hotkey(push_hotkey)
+                if len(steps) != 1:
+                    raise ValueError("Push-to-Transcribe benötigt eine einzelne Tastenkombination.")
                 push_tokens = hotkey_tokens(push_hotkey)
                 if push_tokens:
                     with self._lock:
                         self._push_tokens = push_tokens
-                        self._pressed_keys.clear()
+                        self._push_scan_codes = tuple(frozenset(codes) for codes in steps[0])
+                        self._pressed_scan_codes.clear()
                         self._push_is_down = False
                     self._push_hook = keyboard.hook(self._handle_push_event)
                     logger.info("Push-to-Transcribe Hotkey eventbasiert registriert: %s", push_hotkey)
@@ -147,34 +151,26 @@ class GlobalHotkeyManager(QObject):
             ) from exc
 
     def _handle_push_event(self, event) -> None:
-        key_name = canonical_key_name(str(getattr(event, "name", "") or ""))
-        if not key_name:
-            return
-
+        scan_code = getattr(event, "scan_code", None)
         event_type = getattr(event, "event_type", "")
         emit_pressed = False
         emit_released = False
         with self._lock:
-            if not self._push_tokens or key_name not in self._push_tokens:
+            if not any(scan_code in codes for codes in self._push_scan_codes):
                 return
 
             if event_type == "down":
-                repeated_keydown = key_name in self._pressed_keys
-                self._pressed_keys.add(key_name)
-                if not self._push_is_down and self._push_tokens.issubset(self._pressed_keys):
+                self._pressed_scan_codes.add(scan_code)
+                if not self._push_is_down and self._push_chord_is_down():
                     self._push_is_down = True
                     emit_pressed = True
-                elif repeated_keydown and self._push_is_down:
-                    logger.debug("Wiederholtes Push-to-Transcribe KeyDown ignoriert: %s", key_name)
             elif event_type == "up":
-                self._pressed_keys.discard(key_name)
-                if self._push_is_down and not self._push_tokens.issubset(self._pressed_keys):
+                self._pressed_scan_codes.discard(scan_code)
+                if self._push_is_down and not self._push_chord_is_down():
                     self._push_is_down = False
-                    # Nach einem beendenden KeyUp werden alle Push-Tasten neu erwartet.
-                    self._pressed_keys.difference_update(self._push_tokens)
                     emit_released = True
                 elif not self._push_is_down:
-                    logger.debug("Push-to-Transcribe KeyUp ohne aktiven Druck ignoriert: %s", key_name)
+                    logger.debug("Push-to-Transcribe KeyUp ohne aktiven Druck ignoriert")
 
         if emit_pressed:
             logger.info("Push-to-Transcribe KeyDown erkannt")
@@ -185,9 +181,14 @@ class GlobalHotkeyManager(QObject):
 
     def reset_push_state(self) -> None:
         with self._lock:
-            self._push_is_down = False
-            self._pressed_keys.clear()
+            # Keep physical modifier state when only Space was released.
+            self._push_is_down = self._push_chord_is_down()
         logger.debug("Push-to-Transcribe Hotkey-State defensiv zurückgesetzt")
+
+    def _push_chord_is_down(self) -> bool:
+        return bool(self._push_scan_codes) and all(
+            codes.intersection(self._pressed_scan_codes) for codes in self._push_scan_codes
+        )
 
     def unregister_all(self) -> None:
         if self._push_hook is not None:
@@ -202,7 +203,8 @@ class GlobalHotkeyManager(QObject):
             emit_release = self._push_is_down
             self._push_is_down = False
             self._push_tokens = frozenset()
-            self._pressed_keys.clear()
+            self._push_scan_codes = ()
+            self._pressed_scan_codes.clear()
 
         if emit_release:
             logger.warning(
